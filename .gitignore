@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.DS_Store
+data/products.json
+data/products.before_color_update*.json
+README.md
+
+# Test and coverage artifacts
+.coverage
+coverage.xml
+htmlcov/
+
+# Type checking and lint caches
+.mypy_cache/
+.ruff_cache/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
