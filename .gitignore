@@ -5,7 +5,8 @@ __pycache__/
 .env
 .DS_Store
 data/products.json
-data/products.before_color_update*.json
+data/products.before_*.json
+data/*checkpoint*.json
 README.md
 
 # Test and coverage artifacts
