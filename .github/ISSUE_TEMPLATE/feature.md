@@ -21,4 +21,3 @@ assignees: ""
 ## 💡 Reference
 
 -
->>>>>>> a6c8639 (chore: issue 및 PR 템플릿 추가)
