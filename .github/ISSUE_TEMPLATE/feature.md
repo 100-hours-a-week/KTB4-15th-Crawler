@@ -1,28 +1,24 @@
 ---
-name: Feature
-about: 기능 구현을 위한 이슈
-title: "[FEAT]"
-labels: ''
-assignees: ''
-
+name: "✅ Feature Template"
+about: 기능 추가 이슈 템플릿
+title: "[FEAT] "
+labels: ""
+assignees: ""
 ---
 
-## 작업 내용
+## 📑 Summary
 
-구현할 기능에 대해 간단히 작성
+> 어떤 기능인가요?
 
-## 세부 작업
+-
 
-- [ ] 작업 1
-- [ ] 작업 2
-- [ ] 작업 3
+## ✏️ Task & Description
 
-## 완료 조건
+> 상세 작업 내용을 설명해주세요.
 
-- [ ] 기능 구현 완료
-- [ ] 테스트 완료
-- [ ] PR 생성
+-
 
-## 참고 사항
+## 💡 Reference
 
-관련 문서, 링크, 참고할 내용이 있다면 작성
+-
+>>>>>>> a6c8639 (chore: issue 및 PR 템플릿 추가)
