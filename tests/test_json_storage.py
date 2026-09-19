@@ -5,10 +5,8 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-
 from app.crawler.parser import parse_product
 from app.storage.json_storage import product_to_dict, save_products
-
 from test_parser import CRAWLED_AT, FIXTURE_PATH
 
 
@@ -94,3 +92,36 @@ class JsonStorageTests(unittest.TestCase):
             path = Path(directory) / "nested" / "products.json"
             save_products([product], path)
             self.assertTrue(path.exists())
+
+    def test_merges_by_product_code_with_real_fixture_items(self):
+        response = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        products = [
+            parse_product(item, crawled_at=CRAWLED_AT)
+            for item in response["data"]["list"][:2]
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "products.json"
+            existing = product_to_dict(products[0])
+            existing["product_name"] = "old"
+            path.write_text(json.dumps([existing]), encoding="utf-8")
+            save_products(products, path)
+            stored = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(stored), 2)
+        self.assertEqual(stored[0], existing)
+        self.assertEqual(stored[0]["crawled_at"], CRAWLED_AT.isoformat())
+
+    def test_recognizes_legacy_source_product_id(self):
+        response = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        product = parse_product(response["data"]["list"][0], crawled_at=CRAWLED_AT)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "products.json"
+            path.write_text(json.dumps([{
+                "source_product_id": product.product_code,
+                "product_name": "old",
+            }]), encoding="utf-8")
+            save_products([product], path)
+            stored = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["product_code"], product.product_code)

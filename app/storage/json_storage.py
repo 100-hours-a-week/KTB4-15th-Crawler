@@ -25,13 +25,7 @@ def save_products(
     *,
     max_products: int = DEFAULT_MAX_PRODUCTS,
 ) -> None:
-    """기존 상품을 유지하고 새 product_code만 추가한다.
 
-    다색상 신규 상품은 제외하며, 저장 파일의 고유 product_code 수가
-    ``max_products``에 도달하면 그 이후의 신규 상품은 추가하지 않는다.
-    기존 상품 수는 매 호출 시 현재 파일을 다시 읽어 계산하므로
-    checkpoint/resume로 재실행해도 항상 최신 값을 기준으로 판단한다.
-    """
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     stored: dict[int, dict] = {}
