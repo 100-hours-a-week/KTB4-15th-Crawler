@@ -1,6 +1,5 @@
 import os
 
-
 def _positive_int(name: str, default: str) -> int:
     raw = os.getenv(name, default)
     try:
@@ -29,5 +28,4 @@ CRAWL_TIMEOUT = _positive_int("CRAWL_TIMEOUT", "15")
 CRAWL_REQUEST_DELAY = _non_negative_float("CRAWL_REQUEST_DELAY", "0.5")
 OUTPUT_PATH = os.getenv("OUTPUT_PATH", "data/products.json")
 CRAWL_CHECKPOINT_PATH = os.getenv("CRAWL_CHECKPOINT_PATH") or None
-# 기준 데이터셋(products.json)의 최대 고유 product_code 개수.
 MAX_PRODUCTS = _positive_int("MAX_PRODUCTS", "50000")

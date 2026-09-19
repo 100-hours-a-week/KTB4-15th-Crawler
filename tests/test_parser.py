@@ -6,14 +6,11 @@ from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-from app.crawler.parser import extract_color, parse_product, parse_products
+from app.crawler.parser import parse_product, parse_products
 from app.models.product import Product
-
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "listing_response.json"
 CRAWLED_AT = datetime(2026, 9, 16, 15, 30, tzinfo=timezone(timedelta(hours=9)))
-
 
 class ParserTests(unittest.TestCase):
     def setUp(self):
@@ -32,98 +29,14 @@ class ParserTests(unittest.TestCase):
             "is_sold_out": False,
             "main_category": "",
             "sub_category": "",
-            "color": "아이보리",
+            "color": None,
             "crawled_at": CRAWLED_AT,
         })
 
-    def test_fixture_colors(self):
+    def test_color_is_always_none_regardless_of_colorchip_or_product_name(self):
         products = parse_products(self.response, crawled_at=CRAWLED_AT)
-        self.assertEqual([p.color for p in products],
-                         ["아이보리", "화이트", "블랙", None, "네이비"])
+        self.assertTrue(all(p.color is None for p in products))
         self.assertTrue(products[2].is_sold_out)
-
-    def test_colorchip_uses_first_color_over_product_name(self):
-        self.assertEqual(extract_color(self.item), "아이보리")
-        self.item["itemInfo"]["itemGroup"]["colors"].reverse()
-        self.assertEqual(extract_color(self.item), "블랙")
-
-    def test_colorchip_wins_over_a_different_name_color(self):
-        self.item["itemEvent"]["eventProperties"]["isColorchip"] = True
-        self.item["itemInfo"]["itemGroup"]["colors"] = [{"name": "화이트"}]
-        self.item["itemInfo"]["productName"] = "에센셜 블랙 데님"
-        self.assertEqual(extract_color(self.item), "화이트")
-
-    def test_no_colorchip_ignores_colors(self):
-        self.item["itemEvent"]["eventProperties"]["isColorchip"] = False
-        self.item["itemInfo"]["productName"] = "Half Shirts"
-        self.assertIsNone(extract_color(self.item))
-
-    def test_missing_colors_keep_null_without_name_suffix(self):
-        self.item["itemInfo"]["productName"] = "Half Shirts"
-        for group in (None, {}, {"colors": None}, {"colors": []},
-                      {"colors": [{}]}, {"colors": [{"name": None}]},
-                      {"colors": [{"name": " "}]}, {"colors": [None]},
-                      {"colors": {"name": "블랙"}}):
-            with self.subTest(group=group):
-                self.item["itemInfo"]["itemGroup"] = group
-                self.assertIsNone(extract_color(self.item))
-        del self.item["itemInfo"]["itemGroup"]
-        self.assertIsNone(extract_color(self.item))
-
-    def test_missing_colors_fall_back_to_navy(self):
-        self.item["itemInfo"]["productName"] = "Half Shirts Navy"
-        del self.item["itemInfo"]["itemGroup"]
-        self.assertEqual(extract_color(self.item), "네이비")
-
-    def test_only_first_chip_is_used_before_name_fallback(self):
-        self.item["itemInfo"]["itemGroup"]["colors"][0] = {}
-        self.assertEqual(extract_color(self.item), "화이트")
-
-    def test_clear_color_suffixes(self):
-        self.item["itemEvent"]["eventProperties"]["isColorchip"] = False
-        for suffix, expected in (
-            ("White", "화이트"), ("Black", "블랙"), ("Navy", "네이비"),
-            ("white", "화이트"), ("BLACK", "블랙"), ("[Navy]", "네이비"),
-            ("(White)", "화이트"), ("블랙", "블랙"), ("Off White", "오프화이트"),
-        ):
-            with self.subTest(suffix=suffix):
-                self.item["itemInfo"]["productName"] = f"Half Shirts {suffix} "
-                self.assertEqual(extract_color(self.item), expected)
-
-    def test_color_tokens_are_found_in_the_full_product_name(self):
-        self.item["itemEvent"]["eventProperties"]["isColorchip"] = False
-        for name, expected in (
-            ("[CK] 슬림 스트레이트핏 미드블루 스트레치 데님 4RB902G R81", "미드블루"),
-            ("[CK] 슬림핏 에센셜 블랙 데님 4RB738G 846", "블랙"),
-            ("에센셜 3S 라이프스타일 우븐 쇼츠 - 블랙 / JE1309", "블랙"),
-            ("ESSENTIAL NAVY PANTS", "네이비"),
-            ("Half Shirts Black", "블랙"),
-        ):
-            with self.subTest(name=name):
-                self.item["itemInfo"]["productName"] = name
-                self.assertEqual(extract_color(self.item), expected)
-
-    def test_color_name_false_positive_and_multiple_colors_are_rejected(self):
-        self.item["itemEvent"]["eventProperties"]["isColorchip"] = False
-        for name in ("블랙야크 남성 자켓", "블랙 화이트 배색 티셔츠",
-                     "에센셜 스트레이트 데님 팬츠"):
-            with self.subTest(name=name):
-                self.item["itemInfo"]["productName"] = name
-                self.assertIsNone(extract_color(self.item))
-
-        self.item["itemInfo"]["productName"] = "2001 SLOW WORKER DENIM WASH JACKET [BLACK INDIGO]"
-        self.assertIsNone(extract_color(self.item))
-
-    def test_product_name_suffix_wins_over_another_middle_color(self):
-        self.item["itemEvent"]["eventProperties"]["isColorchip"] = False
-        self.item["itemInfo"]["productName"] = (
-            "TG3-SH2101 인디고 버튼다운 셔츠 - 중청"
-        )
-        self.assertEqual(extract_color(self.item), "중청")
-
-    def test_missing_optional_colorchip_flag(self):
-        del self.item["itemEvent"]["eventProperties"]["isColorchip"]
-        self.assertEqual(parse_product(self.item).color, "화이트")
 
     def test_each_required_field_missing(self):
         paths = (

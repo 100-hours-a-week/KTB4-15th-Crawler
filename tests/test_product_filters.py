@@ -1,5 +1,4 @@
 import unittest
-
 from app.crawler.product_filters import is_multi_color_product
 
 
@@ -42,8 +41,6 @@ class ProductFilterTests(unittest.TestCase):
                 self.assertFalse(is_multi_color_product(name))
 
     def test_underscore_or_bracket_separated_multi_color_is_excluded(self):
-        # 29CM 실제 상품명에서 "_"로 숫자와 colors가 붙는 경우가 흔하다.
-        # \b만 쓰면 "_"가 단어 문자로 취급돼 경계가 성립하지 않아 놓친다.
         for name in (
             "LUN DYEING SWEATSHIRT_2COLORS",
             "Knoll sleeveless (Unisex)_dyed_2 Colors",
@@ -65,11 +62,9 @@ class ProductFilterTests(unittest.TestCase):
                 self.assertTrue(is_multi_color_product(name))
 
     def test_digit_embedded_in_model_code_is_not_excluded(self):
-        # 숫자 바로 앞뒤에 다른 문자/숫자가 붙어 있으면(구분자가 아니면)
-        # colors/컬러 단어가 있어도 오탐하지 않아야 한다.
         for name in (
-            "TG3-SH2101colors 버튼다운 셔츠",  # 숫자가 모델코드(2101)에 붙음
-            "ABC12컬러디자인",  # 숫자 뒤에 한글이 바로 붙어 경계가 아님
+            "TG3-SH2101colors 버튼다운 셔츠",
+            "ABC12컬러디자인",
         ):
             with self.subTest(name=name):
                 self.assertFalse(is_multi_color_product(name))

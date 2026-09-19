@@ -1,5 +1,3 @@
-# API 요청용 main_category(아래 CATEGORIES의 값)를 저장용 main_category로 정규화한다.
-# 요청 category hierarchy(middleId/smallId)는 이 매핑과 무관하게 그대로 유지된다.
 STORAGE_MAIN_CATEGORY_MAP = {
     "상의": "상의",
     "하의": "하의",

@@ -5,13 +5,11 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
 from app.crawler.client import MOST_REVIEWED, RECOMMENDED
-from app.crawler.product_crawler import crawl_products_with_quota
-
+from app.crawler.product_crawler import _category_codes, crawl_products_with_quota
+from test_parser import FIXTURE_PATH
 
 CRAWLED_AT = datetime(2026, 9, 18, 12, 0, tzinfo=timezone(timedelta(hours=9)))
-
 
 def _make_item(code: int, *, product_name: str = None) -> dict:
     return {
@@ -27,12 +25,6 @@ def _make_item(code: int, *, product_name: str = None) -> dict:
 
 
 class QuotaFakeClient:
-    """smallId별로 정해진 개수만큼만 상품을 내어주는 가짜 client.
-
-    정렬(sort)과 무관하게 같은 smallId는 같은 상품 집합을 반환해서
-    실제 API처럼 두 정렬이 같은 카탈로그를 다른 순서로 보여주는 상황을
-    흉내 낸다. product_code는 smallId마다 겹치지 않게 만든다.
-    """
 
     def __init__(self, capacities: dict, *, product_name_by_index=None):
         self.capacities = capacities
@@ -269,6 +261,95 @@ class QuotaCrawlerTests(unittest.TestCase):
         self.assertEqual(
             set(MAIN_CATEGORY_QUOTAS), {"상의", "하의", "아우터", "니트웨어"}
         )
+
+    def test_category_codes_match_male_category_hierarchy(self):
+        self.assertEqual(
+            _category_codes({
+                "main_category": "니트웨어",
+                "sub_category": "기타 니트",
+                "largeId": "272100100",
+                "middleId": "272110100",
+                "smallId": "272110109",
+            }),
+            {
+                "largeId": "272100100",
+                "middleId": "272110100",
+                "smallId": "272110109",
+            },
+        )
+
+    def test_category_codes_reject_mismatched_main_category_id(self):
+        with self.assertRaises(ValueError):
+            _category_codes({
+                "main_category": "니트웨어",
+                "sub_category": "기타 니트",
+                "largeId": "272100100",
+                "middleId": "272102100",
+                "smallId": "272110109",
+            })
+
+    def test_keeps_mismatch_and_uses_requested_category(self):
+        # 응답의 category metadata는 로그/검증에만 쓰이고, 저장값은
+        # 항상 요청한 category를 따라야 한다(29CM 응답이 다른 카테고리를
+        # 가리켜도 상품은 버리지 않고 요청 기준으로 유지).
+        response = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        properties = response["data"]["list"][0]["itemEvent"]["eventProperties"]
+        properties["middleCategoryName"] = "여성의류"
+        properties["smallCategoryName"] = "점프수트"
+
+        class FakeClient:
+            def fetch_listing(self, **kwargs):
+                # fixture는 5개뿐이므로 첫 페이지 이후에는 빈 응답을 줘야
+                # exhausted 처리가 되어 무한 페이지 요청을 하지 않는다.
+                return response if kwargs["page"] == 1 else {"data": {"list": []}}
+
+        result = crawl_products_with_quota(
+            [{
+                "main_category": "아우터",
+                "sub_category": "플리스",
+                "largeId": "272100100",
+                "middleId": "272102100",
+                "smallId": "272102101",
+            }],
+            client=FakeClient(),
+            main_category_quotas={"아우터": 10},
+            sub_category_base_quotas={"아우터": 10},
+            crawled_at=CRAWLED_AT,
+        )
+
+        product = next(
+            p for p in result.products if p.product_code == 3263645
+        )
+        self.assertEqual(product.main_category, "상의")
+        self.assertEqual(product.sub_category, "플리스")
+
+    def test_keeps_item_without_category_metadata(self):
+        response = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+        del response["data"]["list"][0]["itemEvent"]
+
+        class FakeClient:
+            def fetch_listing(self, **kwargs):
+                return response if kwargs["page"] == 1 else {"data": {"list": []}}
+
+        result = crawl_products_with_quota(
+            [{
+                "main_category": "아우터",
+                "sub_category": "플리스",
+                "largeId": "272100100",
+                "middleId": "272102100",
+                "smallId": "272102101",
+            }],
+            client=FakeClient(),
+            main_category_quotas={"아우터": 10},
+            sub_category_base_quotas={"아우터": 10},
+            crawled_at=CRAWLED_AT,
+        )
+
+        product = next(
+            p for p in result.products if p.product_code == 3263645
+        )
+        self.assertEqual((product.main_category, product.sub_category),
+                         ("상의", "플리스"))
 
 
 if __name__ == "__main__":

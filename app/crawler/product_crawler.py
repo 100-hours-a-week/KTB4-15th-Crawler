@@ -56,175 +56,6 @@ def _category_codes(category: Mapping[str, Any]) -> dict[str, str]:
         ) from error
 
 
-def crawl_products(
-    categories: Iterable[Mapping[str, Any]],
-    *,
-    client: TwentyNineCmClient,
-    crawled_at: Optional[datetime] = None,
-    candidate_limit: Optional[int] = None,
-    max_page: int = 2,
-    page_size: int = 50,
-    request_delay: float = 0.0,
-    checkpoint_path: Optional[Union[str, Path]] = None,
-) -> list[Product]:
-    """카테고리와 정렬별 여러 페이지 상품을 모아 중복 제거한다.
-
-    ``checkpoint_path``를 지정하면 다음에 요청할 카테고리/정렬/페이지를
-    요청 처리 후 저장한다. 요청 실패 시에는 해당 요청부터 다시 시작한다.
-    """
-    if candidate_limit is not None and candidate_limit < 1:
-        raise ValueError("candidate_limit은 1 이상이어야 합니다")
-    if max_page < 1:
-        raise ValueError("max_page는 1 이상이어야 합니다")
-    if page_size < 1:
-        raise ValueError("page_size는 1 이상이어야 합니다")
-    if request_delay < 0:
-        raise ValueError("request_delay는 0 이상이어야 합니다")
-    timestamp = crawled_at if crawled_at is not None else datetime.now().astimezone()
-    if timestamp.utcoffset() is None:
-        raise ValueError("crawled_at은 시간대가 포함된 datetime이어야 합니다")
-
-    category_list = list(categories)
-    checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
-    start_category, start_sort, start_page = _load_checkpoint(
-        checkpoint, len(category_list)
-    )
-    unique_products: dict[int, Product] = {}
-    excluded_multi_color = 0
-    sorts = (RECOMMENDED, MOST_REVIEWED)
-    for category_index, category in enumerate(category_list):
-        if category_index < start_category:
-            continue
-        codes = _category_codes(category)
-        requested_main_category = str(category["main_category"])
-        requested_sub_category = str(category["sub_category"])
-        for sort_index, sort in enumerate(sorts):
-            if category_index == start_category and sort_index < start_sort:
-                continue
-            first_page = (
-                start_page
-                if category_index == start_category and sort_index == start_sort
-                else 1
-            )
-            for page in range(first_page, max_page + 1):
-                response = client.fetch_listing(
-                    **codes,
-                    sort=sort,
-                    page=page,
-                    size=page_size,
-                )
-                if request_delay:
-                    time.sleep(request_delay)
-                items = response.get("data", {}).get("list", [])
-                if not items:
-                    if checkpoint is not None:
-                        next_category, next_sort, next_page = _next_sort_position(
-                            category_index,
-                            sort_index,
-                            len(category_list),
-                        )
-                        _save_checkpoint(
-                            checkpoint, next_category, next_sort, next_page
-                        )
-                    break
-                products = parse_products(response, crawled_at=timestamp)
-                selected = (
-                    products
-                    if candidate_limit is None
-                    else products[:candidate_limit]
-                )
-                for product in selected:
-                    if is_multi_color_product(product.product_name):
-                        excluded_multi_color += 1
-                        continue
-                    raw_item = _find_item(response, product.product_code)
-                    _log_category_mismatch(
-                        raw_item,
-                        product.product_code,
-                        requested_main_category,
-                        requested_sub_category,
-                        sort,
-                    )
-                    stored_main_category = STORAGE_MAIN_CATEGORY_MAP[
-                        requested_main_category
-                    ]
-                    stored_product = replace(
-                        product,
-                        main_category=stored_main_category,
-                        sub_category=requested_sub_category,
-                        color=None,
-                    )
-                    unique_products.setdefault(
-                        product.product_code, stored_product
-                    )
-                if checkpoint is not None:
-                    next_category, next_sort, next_page = _next_position(
-                        category_index, sort_index, page, len(category_list), max_page
-                    )
-                    _save_checkpoint(
-                        checkpoint, next_category, next_sort, next_page
-                    )
-    if checkpoint is not None:
-        checkpoint.unlink(missing_ok=True)
-    if excluded_multi_color:
-        logger.info(
-            "다중 색상 상품 제외: count=%s",
-            excluded_multi_color,
-        )
-    return list(unique_products.values())
-
-
-def _next_position(
-    category_index: int,
-    sort_index: int,
-    page: int,
-    category_count: int,
-    max_page: int,
-) -> tuple[int, int, int]:
-    """현재 요청 다음에 처리할 요청 위치를 반환한다."""
-    if page < max_page:
-        return category_index, sort_index, page + 1
-    return _next_sort_position(category_index, sort_index, category_count)
-
-
-def _next_sort_position(
-    category_index: int, sort_index: int, category_count: int
-) -> tuple[int, int, int]:
-    """현재 정렬을 끝내고 다음 정렬 또는 카테고리로 이동한다."""
-    if sort_index == 1:
-        return category_index + 1, 0, 1
-    return category_index, sort_index + 1, 1
-
-
-def _load_checkpoint(
-    path: Optional[Path], category_count: int
-) -> tuple[int, int, int]:
-    if path is None or not path.exists():
-        return 0, 0, 1
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-        category = int(state["category_index"])
-        sort = int(state["sort_index"])
-        page = int(state["page"])
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
-        raise ValueError(f"체크포인트를 읽을 수 없습니다: {path}") from error
-    if not (0 <= category <= category_count and sort in (0, 1) and page >= 1):
-        raise ValueError(f"체크포인트 값이 올바르지 않습니다: {path}")
-    return category, sort, page
-
-
-def _save_checkpoint(path: Path, category: int, sort: int, page: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {"category_index": category, "sort_index": sort, "page": page},
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-
 def _find_item(response: Mapping[str, Any], product_code: int) -> Mapping[str, Any]:
     """응답에서 상품 원본을 찾아 category metadata 검증에 사용한다."""
     data = response.get("data")
@@ -289,7 +120,6 @@ def _sub_category_fully_exhausted(state: Mapping[str, Any]) -> bool:
     """두 정렬 모두 더 이상 반환할 상품이 없는지 확인한다."""
     return all(sort_state["exhausted"] for sort_state in state["sorts"])
 
-
 def _load_quota_checkpoint(
     path: Optional[Path],
     category_count: int,
@@ -352,26 +182,7 @@ def crawl_products_with_quota(
     checkpoint_path: Optional[Union[str, Path]] = None,
     on_products_collected: Optional[Callable[[list[Product]], None]] = None,
 ) -> QuotaCrawlResult:
-    """요청 main_category별 quota를 채울 때까지 sub_category를 순회한다.
-
-    1차로 각 sub_category는 ``sub_category_base_quotas``만큼만 채우고,
-    main_category quota가 남았는데 아직 소진(exhausted)되지 않은
-    sub_category가 있으면 그 부족분을 재분배해서 추가로 채운다.
-    저장되는 main_category는 상의/하의로 정규화되어 아우터/니트웨어
-    구분이 사라지므로, quota는 ``requested_main_category`` 기준으로 센다.
-    ``checkpoint_path``를 지정하면 main_category별 카운트와
-    sub_category별 진행 상태(수집 수, 정렬별 페이지/소진 여부)를
-    매 페이지 처리 후 저장해 재실행 시 이어서 진행한다.
-
-    ``on_products_collected``는 페이지 단위로 새로 채택된 상품을
-    즉시 전달받는 콜백이다(예: ``save_products``와 연결). 체크포인트는
-    이 콜백 호출 *다음*에 저장되므로, 체크포인트가 "이미 처리됨"이라고
-    기록한 페이지의 상품은 항상 먼저 영속화된 상태다. 콜백 없이
-    반환값(``QuotaCrawlResult.products``)만 사용하면, 중간에 실패한 뒤
-    재실행했을 때 실패 이전 호출에서 이미 수집됐던 상품은 이번 반환값에
-    다시 포함되지 않는다 — 장시간 수집에서는 반드시 콜백으로 즉시
-    저장해야 크래시 시 데이터 유실을 막을 수 있다.
-    """
+    """카테고리별 quota를 준수하며 상품을 수집한다."""
     if page_size < 1:
         raise ValueError("page_size는 1 이상이어야 합니다")
     if request_delay < 0:
@@ -450,7 +261,6 @@ def crawl_products_with_quota(
                             product,
                             main_category=stored_main,
                             sub_category=requested_sub,
-                            color=None,
                         )
                         unique_products[product.product_code] = stored_product
                         newly_collected.append(stored_product)
@@ -477,8 +287,7 @@ def crawl_products_with_quota(
                 break
             fill(index, target=base_quota)
 
-        # 2차: main_category quota가 남으면 아직 소진되지 않은
-        # sub_category에 부족분을 재분배한다.
+        # 2차: main_category quota가 남으면 아직 소진되지 않은 sub_category에 부족분을 재분배한다.
         for index in indices:
             if main_counts[main] >= main_quota:
                 break
