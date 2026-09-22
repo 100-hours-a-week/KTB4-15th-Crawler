@@ -9,6 +9,7 @@ data/*checkpoint*.json
 README.md
 mydb.dump
 *.dump
+.venv-validation/
 
 # Test and coverage artifacts
 .coverage
@@ -27,3 +28,7 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# 상품 이미지 검증 도구(scripts/validate_product_images.py)의 로컬 산출물
+validation_results/
+models/*.task
