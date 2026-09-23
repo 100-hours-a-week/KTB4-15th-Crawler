@@ -58,6 +58,21 @@ class DetectionResult:
 
 
 @dataclass(frozen=True)
+class CroppedLowerBodyCheck:
+    """하의 + person 1 + garment 1 + MediaPipe landmarks 없음 전용 bbox fallback 결과.
+
+    person_top_ratio/garment_top_ratio/garment_person_area_ratio/garment_in_person_ratio
+    는 --debug 출력에도 그대로 쓴다(app.validation.detector.check_cropped_lower_body).
+    """
+
+    person_top_ratio: float
+    garment_top_ratio: float
+    garment_person_area_ratio: float
+    garment_in_person_ratio: float
+    is_cropped_lower_body: bool
+
+
+@dataclass(frozen=True)
 class ValidationResult:
     status: ValidationStatus
     reason: ValidationReason

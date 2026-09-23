@@ -6,7 +6,7 @@ PyTorch + Hugging Face Transformers 의 zero-shot object detection 을 그대로
 
 from collections.abc import Sequence
 
-from app.validation.models import Detection, DetectionResult
+from app.validation.models import CroppedLowerBodyCheck, Detection, DetectionResult
 
 # 실제 이미지로 조정이 필요한 값들은 이 파일 한 곳에 모아둔다 (요구사항 §5, §21).
 DEFAULT_MODEL_ID = "IDEA-Research/grounding-dino-tiny"
@@ -90,6 +90,14 @@ MAIN_CATEGORY_DETECTION_LABELS: dict[str, list[str]] = {
 # 구분할 때 쓴다. 위와 마찬가지로 저장된 main_category 값 기준이다.
 BOTTOM_MAIN_CATEGORY = "하의"
 
+# 하의 + person 1 + garment 1 + MediaPipe landmarks 없음(사람이 화면 위쪽 끝까지 잘려
+# MediaPipe 가 사람 자체를 못 잡은 경우) 전용 bbox fallback threshold다. 실제 이미지로
+# 조정이 필요하다(요구사항 §21과 같은 맥락).
+CROPPED_LOWER_BODY_PERSON_TOP_RATIO_MAX = 0.01
+CROPPED_LOWER_BODY_GARMENT_TOP_RATIO_MAX = 0.30
+CROPPED_LOWER_BODY_GARMENT_PERSON_AREA_RATIO_MIN = 0.42
+CROPPED_LOWER_BODY_GARMENT_IN_PERSON_RATIO_MIN = 0.90
+
 
 def get_detection_labels(main_category: str, sub_category: str) -> list[str] | None:
     """sub_category 를 우선 사용하고 없으면 main_category 로 대체한다.
@@ -103,17 +111,28 @@ def get_detection_labels(main_category: str, sub_category: str) -> list[str] | N
     return MAIN_CATEGORY_DETECTION_LABELS.get(main_category)
 
 
-def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
-    ax0, ay0, ax1, ay1 = a
-    bx0, by0, bx1, by1 = b
+Box = tuple[float, float, float, float]
+
+
+def box_area(box: Box) -> float:
+    """box 는 (x0, y0, x1, y1) 이다. 재사용 가능한 작은 함수로 분리해 중복 계산을 피한다."""
+    x0, y0, x1, y1 = box
+    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+
+def intersection_area(box_a: Box, box_b: Box) -> float:
+    ax0, ay0, ax1, ay1 = box_a
+    bx0, by0, bx1, by1 = box_b
     inter_x0, inter_y0 = max(ax0, bx0), max(ay0, by0)
     inter_x1, inter_y1 = min(ax1, bx1), min(ay1, by1)
-    inter_area = max(0.0, inter_x1 - inter_x0) * max(0.0, inter_y1 - inter_y0)
+    return max(0.0, inter_x1 - inter_x0) * max(0.0, inter_y1 - inter_y0)
+
+
+def _iou(a: Box, b: Box) -> float:
+    inter_area = intersection_area(a, b)
     if inter_area <= 0:
         return 0.0
-    area_a = (ax1 - ax0) * (ay1 - ay0)
-    area_b = (bx1 - bx0) * (by1 - by0)
-    union_area = area_a + area_b - inter_area
+    union_area = box_area(a) + box_area(b) - inter_area
     return inter_area / union_area if union_area > 0 else 0.0
 
 
@@ -131,6 +150,52 @@ def deduplicate_by_iou(
         if all(_iou(candidate.box, other.box) < iou_threshold for other in kept):
             kept.append(candidate)
     return kept
+
+
+def check_cropped_lower_body(
+    *, person_box: Box, garment_box: Box, image_height: float
+) -> CroppedLowerBodyCheck:
+    """하의 + person 1 + garment 1 + MediaPipe landmarks 없음일 때만 호출한다.
+
+    사람이 화면 위쪽 끝까지 잘려 있고(person_top_ratio), 하의가 화면 상단 30% 안에서
+    시작하며(garment_top_ratio), 하의 박스가 사람 박스의
+    CROPPED_LOWER_BODY_GARMENT_PERSON_AREA_RATIO_MIN 이상을 차지하고
+    (garment_person_area_ratio), 하의 박스가 사람 박스 안에 거의 다 들어가 있으면
+    (garment_in_person_ratio) 정상적으로 하의를 입은 크롭샷으로 본다.
+
+    Grounding DINO 의 threshold/NMS 판정에는 관여하지 않는다. person_box/garment_box
+    가 이미 dedup 을 끝낸 최종 detection 이라고 가정한다.
+    """
+    person_area = box_area(person_box)
+    garment_area = box_area(garment_box)
+
+    if image_height <= 0 or person_area <= 0 or garment_area <= 0:
+        return CroppedLowerBodyCheck(
+            person_top_ratio=1.0,
+            garment_top_ratio=1.0,
+            garment_person_area_ratio=0.0,
+            garment_in_person_ratio=0.0,
+            is_cropped_lower_body=False,
+        )
+
+    person_top_ratio = person_box[1] / image_height
+    garment_top_ratio = garment_box[1] / image_height
+    garment_person_area_ratio = garment_area / person_area
+    garment_in_person_ratio = intersection_area(person_box, garment_box) / garment_area
+
+    is_cropped_lower_body = (
+        person_top_ratio <= CROPPED_LOWER_BODY_PERSON_TOP_RATIO_MAX
+        and garment_top_ratio <= CROPPED_LOWER_BODY_GARMENT_TOP_RATIO_MAX
+        and garment_person_area_ratio >= CROPPED_LOWER_BODY_GARMENT_PERSON_AREA_RATIO_MIN
+        and garment_in_person_ratio >= CROPPED_LOWER_BODY_GARMENT_IN_PERSON_RATIO_MIN
+    )
+    return CroppedLowerBodyCheck(
+        person_top_ratio=person_top_ratio,
+        garment_top_ratio=garment_top_ratio,
+        garment_person_area_ratio=garment_person_area_ratio,
+        garment_in_person_ratio=garment_in_person_ratio,
+        is_cropped_lower_body=is_cropped_lower_body,
+    )
 
 
 class GroundingDinoDetector:

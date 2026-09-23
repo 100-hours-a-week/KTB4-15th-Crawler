@@ -188,14 +188,22 @@ class PoseEstimator:
         )
         self._landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(options)
 
+    def get_landmarks(self, image_rgb) -> BodyLandmarks | None:
+        """classify_direction 을 거치기 전의 원본 landmark 값이다. 디버깅 출력에 쓴다.
+
+        estimate_direction() 도 내부적으로 이 메서드를 쓴다. 동작은 그대로이고,
+        추출 단계를 별도로 호출할 수 있게 이름만 붙인 것이다.
+        """
+        mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=image_rgb)
+        result = self._landmarker.detect(mp_image)
+        return extract_landmarks(result)
+
     def estimate_direction(
         self, image_rgb, *, allow_lower_body_fallback: bool = False
     ) -> PoseDirection:
         """image_rgb 는 HxWx3 RGB numpy 배열이다."""
-        mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=image_rgb)
-        result = self._landmarker.detect(mp_image)
         return classify_direction(
-            extract_landmarks(result), allow_lower_body_fallback=allow_lower_body_fallback
+            self.get_landmarks(image_rgb), allow_lower_body_fallback=allow_lower_body_fallback
         )
 
     def close(self) -> None:

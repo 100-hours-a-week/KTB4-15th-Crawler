@@ -17,6 +17,7 @@ from app.validation import rules
 from app.validation.detector import (
     BOTTOM_MAIN_CATEGORY,
     GroundingDinoDetector,
+    check_cropped_lower_body,
     get_detection_labels,
 )
 from app.validation.models import (
@@ -25,7 +26,7 @@ from app.validation.models import (
     ValidationResult,
     ValidationStatus,
 )
-from app.validation.pose import PoseEstimator
+from app.validation.pose import PoseEstimator, classify_direction
 
 IMAGE_DOWNLOAD_TIMEOUT = 15
 _USER_AGENT = "Mozilla/5.0 (compatible; LookDDak-ImageValidator/1.0)"
@@ -87,8 +88,26 @@ def validate_product_image(
         allow_lower_body_fallback = (
             product.main_category == BOTTOM_MAIN_CATEGORY and detection.garment_count == 1
         )
-        pose_direction = pose_estimator.estimate_direction(
-            image_rgb, allow_lower_body_fallback=allow_lower_body_fallback
-        )
+        # MediaPipe 는 여기서 딱 한 번만 돌린다. landmarks 가 있으면 기존 classify_direction
+        # 로직을 그대로 쓰고, None 일 때만(=MediaPipe 가 사람을 아예 못 잡았을 때만) 하의 +
+        # garment 1개 조합에 한해 Grounding DINO bbox 로 대신 판단한다.
+        landmarks = pose_estimator.get_landmarks(image_rgb)
+
+        if landmarks is not None:
+            pose_direction = classify_direction(
+                landmarks, allow_lower_body_fallback=allow_lower_body_fallback
+            )
+        elif allow_lower_body_fallback:
+            crop_check = check_cropped_lower_body(
+                person_box=detection.persons[0].box,
+                garment_box=detection.garments[0].box,
+                image_height=image_rgb.shape[0],
+            )
+            if crop_check.is_cropped_lower_body:
+                pose_direction = PoseDirection.FRONT
+            else:
+                pose_direction = PoseDirection.UNCERTAIN
+        else:
+            pose_direction = PoseDirection.UNCERTAIN
 
     return rules.decide(detection, pose_direction)
