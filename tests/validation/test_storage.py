@@ -95,6 +95,33 @@ class GetPendingProductsTests(unittest.TestCase):
         self.assertEqual(params, (10,))
 
 
+class GetProductByCodeTests(unittest.TestCase):
+    def test_returns_the_product_when_found(self):
+        connection = FakeConnection(rows=[_ROW])
+
+        product = storage.get_product_by_code(connection, 1001)
+
+        self.assertIsNotNone(product)
+        self.assertEqual(product.product_code, 1001)
+        self.assertEqual(product.sub_category, "스웨트셔츠")
+
+    def test_returns_none_when_not_found(self):
+        connection = FakeConnection(rows=[])
+
+        self.assertIsNone(storage.get_product_by_code(connection, 999))
+
+    def test_ignores_validation_status_filter(self):
+        # PENDING 이 아니어도(이미 PASS/FAIL 이어도) 조회할 수 있어야 한다.
+        connection = FakeConnection(rows=[_ROW])
+
+        storage.get_product_by_code(connection, 1001)
+
+        [(sql, params)] = connection._cursor.executed
+        self.assertNotIn("validation_status", sql)
+        self.assertIn("WHERE product_code = %s", sql)
+        self.assertEqual(params, (1001,))
+
+
 class UpdateValidationResultTests(unittest.TestCase):
     def test_updates_status_and_reason_and_commits(self):
         connection = FakeConnection()

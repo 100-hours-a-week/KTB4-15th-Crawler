@@ -237,6 +237,99 @@ class BottomWearLowerBodyFallbackTests(unittest.TestCase):
         self.assertEqual(with_fallback, PoseDirection.FRONT)
 
 
+class PoseEstimatorGetLandmarksTests(unittest.TestCase):
+    """get_landmarks()/estimate_direction() 의 동작이 리팩터링 전과 같은지 확인한다."""
+
+    def _build_estimator(self, pose_landmarks: list) -> PoseEstimator:
+        cpu_delegate = object()
+        image_mode = object()
+
+        class FakeBaseOptions:
+            Delegate = SimpleNamespace(CPU=cpu_delegate)
+
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class FakePoseLandmarkerOptions:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class FakeLandmarker:
+            @staticmethod
+            def create_from_options(options):
+                return FakeLandmarker()
+
+            def detect(self, mp_image):
+                return _FakePoseLandmarkerResult(pose_landmarks=pose_landmarks)
+
+            def close(self):
+                pass
+
+        class FakeImage:
+            def __init__(self, *, image_format, data):
+                self.image_format = image_format
+                self.data = data
+
+        fake_mediapipe = ModuleType("mediapipe")
+        fake_mediapipe.ImageFormat = SimpleNamespace(SRGB=object())
+        fake_mediapipe.Image = FakeImage
+        fake_mediapipe.tasks = SimpleNamespace(
+            BaseOptions=FakeBaseOptions,
+            vision=SimpleNamespace(
+                PoseLandmarkerOptions=FakePoseLandmarkerOptions,
+                RunningMode=SimpleNamespace(IMAGE=image_mode),
+                PoseLandmarker=FakeLandmarker,
+            ),
+        )
+
+        with TemporaryDirectory() as temporary_directory:
+            model_path = Path(temporary_directory) / "pose_landmarker.task"
+            model_path.touch()
+            with patch.dict("sys.modules", {"mediapipe": fake_mediapipe}):
+                return PoseEstimator(model_path=str(model_path))
+
+    def test_get_landmarks_extracts_the_detected_pose(self):
+        points = _fake_33_landmarks(
+            {
+                11: _Landmark(0.6, 0.4, 0.9),  # left shoulder
+                12: _Landmark(0.4, 0.4, 0.9),  # right shoulder
+                23: _Landmark(0.55, 0.7, 0.9),  # left hip
+                24: _Landmark(0.45, 0.7, 0.9),  # right hip
+            }
+        )
+        estimator = self._build_estimator(pose_landmarks=[points])
+
+        landmarks = estimator.get_landmarks("fake-image")
+
+        self.assertIsNotNone(landmarks)
+        self.assertAlmostEqual(landmarks.left_shoulder_x, 0.6)
+        estimator.close()
+
+    def test_get_landmarks_returns_none_when_nobody_is_detected(self):
+        estimator = self._build_estimator(pose_landmarks=[])
+
+        self.assertIsNone(estimator.get_landmarks("fake-image"))
+        estimator.close()
+
+    def test_estimate_direction_still_works_through_get_landmarks(self):
+        # 어깨가 뚜렷하게 반전된, 정면으로 보는 사람 케이스.
+        points = _fake_33_landmarks(
+            {
+                0: _Landmark(0.5, 0.2, 0.9),  # nose
+                11: _Landmark(0.65, 0.4, 0.9),  # left shoulder
+                12: _Landmark(0.35, 0.4, 0.9),  # right shoulder
+                23: _Landmark(0.55, 0.7, 0.9),  # left hip
+                24: _Landmark(0.45, 0.7, 0.9),  # right hip
+            }
+        )
+        estimator = self._build_estimator(pose_landmarks=[points])
+
+        direction = estimator.estimate_direction("fake-image")
+
+        self.assertEqual(direction, PoseDirection.FRONT)
+        estimator.close()
+
+
 class PoseEstimatorOptionsTests(unittest.TestCase):
     def test_initializes_image_mode_cpu_without_segmentation_masks(self):
         cpu_delegate = object()
