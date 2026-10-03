@@ -1,0 +1,15 @@
+# 상품 이미지 검증(scripts/validate_product_images.py) 전용 의존성이다. 로컬에서만 쓴다.
+#
+# 운영 크롤러(requirements.txt)에는 포함하지 않는다. torch/transformers/mediapipe/
+# opencv 는 무겁고, 운영 Docker 이미지에는 필요 없기 때문이다.
+#
+# 설치: pip install -r requirements-validation.txt
+
+-r requirements.txt
+
+torch>=2.2
+transformers>=4.40
+mediapipe==0.10.35
+opencv-python>=4.9
+Pillow>=10.0
+numpy>=1.26
