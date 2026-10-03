@@ -49,6 +49,7 @@ from app.validation.pose import (
     classify_direction,
     has_sufficient_lower_body_landmarks,
     has_sufficient_upper_body_landmarks,
+    is_direction_landmark_reliable,
 )
 from app.validation.product_image_validator import (
     download_image,
@@ -239,35 +240,19 @@ def _debug_validate_product(product: Product, *, detector, pose_estimator) -> No
         print(f"allow_lower_body_fallback = {allow_lower_body_fallback}")
 
         landmarks = pose_estimator.get_landmarks(image_rgb)
+        landmark_reliable = (
+            landmarks is not None and is_direction_landmark_reliable(landmarks)
+        )
+        print(f"landmark_reliable = {landmark_reliable}")
         if landmarks is None:
             print("landmarks = None (MediaPipe 가 사람을 감지하지 못했습니다)")
-            if allow_lower_body_fallback:
-                # 하의 + garment 1개인데 MediaPipe 가 사람을 아예 못 잡은 경우다.
-                # classify_direction(None, ...) 은 항상 UNCERTAIN 이므로(그대로 둔다),
-                # bbox 기반으로 한 번 더 확인해서 왜 fallback 이 적용/미적용됐는지 보여준다.
-                crop_check = check_cropped_lower_body(
-                    person_box=detection.persons[0].box,
-                    garment_box=detection.garments[0].box,
-                    image_height=height,
-                )
-                print(f"person_top_ratio = {crop_check.person_top_ratio:.4f}")
-                print(f"garment_top_ratio = {crop_check.garment_top_ratio:.4f}")
-                print(f"garment_person_area_ratio = {crop_check.garment_person_area_ratio:.4f}")
-                print(f"garment_in_person_ratio = {crop_check.garment_in_person_ratio:.4f}")
-                print(f"is_cropped_lower_body = {crop_check.is_cropped_lower_body}")
-                pose_direction = (
-                    PoseDirection.FRONT
-                    if crop_check.is_cropped_lower_body
-                    else PoseDirection.UNCERTAIN
-                )
-            else:
-                pose_direction = PoseDirection.UNCERTAIN
         else:
             print(f"nose visibility = {landmarks.nose_visibility:.3f}")
-            print(f"left shoulder visibility = {landmarks.left_shoulder_visibility:.3f}")
-            print(f"right shoulder visibility = {landmarks.right_shoulder_visibility:.3f}")
-            print(f"left hip visibility = {landmarks.left_hip_visibility:.3f}")
-            print(f"right hip visibility = {landmarks.right_hip_visibility:.3f}")
+            print(f"left_shoulder_visibility = {landmarks.left_shoulder_visibility:.3f}")
+            print(f"right_shoulder_visibility = {landmarks.right_shoulder_visibility:.3f}")
+            print(f"left_hip_visibility = {landmarks.left_hip_visibility:.3f}")
+            print(f"right_hip_visibility = {landmarks.right_hip_visibility:.3f}")
+            print(f"torso_scale = {landmarks.torso_scale:.3f}")
             print(f"left knee visibility = {landmarks.left_knee_visibility:.3f}")
             print(f"right knee visibility = {landmarks.right_knee_visibility:.3f}")
             print(f"left ankle visibility = {landmarks.left_ankle_visibility:.3f}")
@@ -280,9 +265,29 @@ def _debug_validate_product(product: Product, *, detector, pose_estimator) -> No
                 "has_sufficient_lower_body_landmarks = "
                 f"{has_sufficient_lower_body_landmarks(landmarks)}"
             )
+
+        if landmark_reliable:
             pose_direction = classify_direction(
                 landmarks, allow_lower_body_fallback=allow_lower_body_fallback
             )
+        elif allow_lower_body_fallback:
+            crop_check = check_cropped_lower_body(
+                person_box=detection.persons[0].box,
+                garment_box=detection.garments[0].box,
+                image_height=height,
+            )
+            print(f"person_top_ratio = {crop_check.person_top_ratio:.4f}")
+            print(f"garment_top_ratio = {crop_check.garment_top_ratio:.4f}")
+            print(f"garment_person_area_ratio = {crop_check.garment_person_area_ratio:.4f}")
+            print(f"garment_in_person_ratio = {crop_check.garment_in_person_ratio:.4f}")
+            print(f"is_cropped_lower_body = {crop_check.is_cropped_lower_body}")
+            pose_direction = (
+                PoseDirection.FRONT
+                if crop_check.is_cropped_lower_body
+                else PoseDirection.UNCERTAIN
+            )
+        else:
+            pose_direction = PoseDirection.UNCERTAIN
 
         print(f"pose_direction = {pose_direction.value}")
     else:

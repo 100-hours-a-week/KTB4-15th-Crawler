@@ -2,7 +2,12 @@
 
 import unittest
 
-from app.validation.models import Detection, DetectionResult, PoseDirection, ValidationStatus
+from app.validation.models import (
+    Detection,
+    DetectionResult,
+    PoseDirection,
+    ValidationStatus,
+)
 from app.validation.rules import decide
 
 _BOX = (0.0, 0.0, 10.0, 10.0)
@@ -43,6 +48,16 @@ class MultiplePersonsTests(unittest.TestCase):
 
 
 class SinglePersonPoseTests(unittest.TestCase):
+    def test_no_garment_fails_without_using_pose(self):
+        outcome = decide(_result(persons=1, garments=0), PoseDirection.FRONT)
+        self.assertEqual(outcome.status, ValidationStatus.FAIL)
+        self.assertEqual(outcome.reason.value, "GARMENT_NOT_FOUND")
+
+    def test_multiple_garments_fail_without_using_pose(self):
+        outcome = decide(_result(persons=1, garments=2), PoseDirection.FRONT)
+        self.assertEqual(outcome.status, ValidationStatus.FAIL)
+        self.assertEqual(outcome.reason.value, "MULTIPLE_GARMENTS")
+
     def test_front_passes(self):
         outcome = decide(_result(persons=1, garments=1), PoseDirection.FRONT)
         self.assertEqual(outcome.status, ValidationStatus.PASS)

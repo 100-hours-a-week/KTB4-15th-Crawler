@@ -26,7 +26,11 @@ from app.validation.models import (
     ValidationResult,
     ValidationStatus,
 )
-from app.validation.pose import PoseEstimator, classify_direction
+from app.validation.pose import (
+    PoseEstimator,
+    classify_direction,
+    is_direction_landmark_reliable,
+)
 
 IMAGE_DOWNLOAD_TIMEOUT = 15
 _USER_AGENT = "Mozilla/5.0 (compatible; LookDDak-ImageValidator/1.0)"
@@ -82,18 +86,18 @@ def validate_product_image(
     detection = detector.detect(image_rgb, labels)
 
     pose_direction: PoseDirection | None = None
-    if detection.person_count == 1:
-        # 하의 상품은 상반신이 잘려 찍혀도 정상일 수 있다. 그 경우에만 상체
-        # landmark 가 부족할 때 하체 landmark 로 대신 판정하게 한다(pose.py 참고).
-        allow_lower_body_fallback = (
-            product.main_category == BOTTOM_MAIN_CATEGORY and detection.garment_count == 1
-        )
-        # MediaPipe 는 여기서 딱 한 번만 돌린다. landmarks 가 있으면 기존 classify_direction
-        # 로직을 그대로 쓰고, None 일 때만(=MediaPipe 가 사람을 아예 못 잡았을 때만) 하의 +
-        # garment 1개 조합에 한해 Grounding DINO bbox 로 대신 판단한다.
+    if detection.person_count == 1 and detection.garment_count == 1:
+        # 하의 상품은 상반신이 잘려 찍혀도 정상일 수 있으므로, 방향 판정용
+        # landmark 가 없거나 신뢰할 수 없을 때 기존 bbox fallback 을 허용한다.
+        allow_lower_body_fallback = product.main_category == BOTTOM_MAIN_CATEGORY
+        # MediaPipe 는 여기서 딱 한 번만 돌린다. 이후 quality gate, 방향 판정,
+        # bbox fallback 은 이 결과와 기존 Grounding DINO detection 만 사용한다.
         landmarks = pose_estimator.get_landmarks(image_rgb)
+        landmark_reliable = (
+            landmarks is not None and is_direction_landmark_reliable(landmarks)
+        )
 
-        if landmarks is not None:
+        if landmark_reliable:
             pose_direction = classify_direction(
                 landmarks, allow_lower_body_fallback=allow_lower_body_fallback
             )

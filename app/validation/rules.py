@@ -24,7 +24,8 @@ def decide(
 ) -> ValidationResult:
     """요구사항 §2 의 판정 기준을 그대로 옮긴 것이다.
 
-    person_count == 1 일 때만 pose_direction 을 사용한다. 그 외에는 무시한다.
+    person_count == 1, garment_count == 1 일 때만 pose_direction 을 사용한다.
+    그 외에는 개수 판정 결과를 반환한다.
     """
     if detection.person_count == 0:
         if detection.garment_count == 1:
@@ -37,6 +38,12 @@ def decide(
         return ValidationResult(ValidationStatus.FAIL, ValidationReason.MULTIPLE_PERSONS)
 
     # person_count == 1
+    if detection.garment_count == 0:
+        return ValidationResult(ValidationStatus.FAIL, ValidationReason.GARMENT_NOT_FOUND)
+    if detection.garment_count >= 2:
+        return ValidationResult(ValidationStatus.FAIL, ValidationReason.MULTIPLE_GARMENTS)
+
+    # person_count == 1 and garment_count == 1
     if pose_direction is None:
         pose_direction = PoseDirection.UNCERTAIN
     reason = _POSE_REASON[pose_direction]

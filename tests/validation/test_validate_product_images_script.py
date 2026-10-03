@@ -484,8 +484,8 @@ class MainSingleProductTests(unittest.TestCase):
         self.assertEqual(writes, [])
 
     def test_debug_prints_every_intermediate_value_for_a_bottom_product(self):
-        # 하의 + garment 1개 + 사람 1명 + 상체 landmark 부족 + 하체 landmark 충분
-        # -> allow_lower_body_fallback=True, pose_direction=FRONT, 최종 PASS.
+        # 하의 + garment 1개 + 사람 1명 + quality BAD landmarks + bbox 조건 충족
+        # -> landmark_reliable=False, 기존 bbox fallback 으로 FRONT, 최종 PASS.
         #
         # 실제 파일 저장(_save_debug_image 의 진짜 동작)은 SaveDebugImageTests 가 따로
         # 검증하므로, 여기서는 fake 로 바꿔서 "무엇을 넘겨 호출했는지·출력에 경로가
@@ -498,8 +498,8 @@ class MainSingleProductTests(unittest.TestCase):
             ]
         )
         detection = DetectionResult(
-            persons=[Detection("person", 0.9, (5.0, 5.0, 40.0, 90.0))],
-            garments=[Detection("slim pants", 0.85, (10.0, 50.0, 35.0, 95.0))],
+            persons=[Detection("person", 0.9, (100.0, 0.0, 400.0, 990.0))],
+            garments=[Detection("slim pants", 0.85, (120.0, 200.0, 380.0, 950.0))],
         )
         landmarks = BodyLandmarks(
             nose_visibility=0.1,
@@ -516,7 +516,7 @@ class MainSingleProductTests(unittest.TestCase):
             left_ankle_visibility=0.1,
             right_ankle_visibility=0.1,
         )
-        fake_image = np.zeros((100, 50, 3), dtype=np.uint8)  # height=100, width=50
+        fake_image = np.zeros((1000, 500, 3), dtype=np.uint8)
         fake_debug_path = Path("/fake/debug_1001.jpg")
         save_debug_image_calls = []
 
@@ -549,29 +549,32 @@ class MainSingleProductTests(unittest.TestCase):
             "main_category = 하의",
             "sub_category = 슬림 팬츠",
             "detection labels",
-            "image width = 50",
-            "image height = 100",
+            "image width = 500",
+            "image height = 1000",
             "person_count = 1",
             "garment_count = 1",
             "person[0] label = person",
             "person[0] score = 0.900",
-            "person[0] box = [5.0, 5.0, 40.0, 90.0]",
+            "person[0] box = [100.0, 0.0, 400.0, 990.0]",
             "garment[0] label = slim pants",
             "garment[0] score = 0.850",
-            "garment[0] box = [10.0, 50.0, 35.0, 95.0]",
+            "garment[0] box = [120.0, 200.0, 380.0, 950.0]",
             f"debug image = {fake_debug_path}",
             "allow_lower_body_fallback = True",
+            "landmark_reliable = False",
             "nose visibility",
-            "left shoulder visibility",
-            "right shoulder visibility",
-            "left hip visibility",
-            "right hip visibility",
+            "left_shoulder_visibility = 0.100",
+            "right_shoulder_visibility = 0.100",
+            "left_hip_visibility = 0.900",
+            "right_hip_visibility = 0.900",
+            "torso_scale = 0.300",
             "left knee visibility",
             "right knee visibility",
             "left ankle visibility",
             "right ankle visibility",
             "has_sufficient_upper_body_landmarks = False",
             "has_sufficient_lower_body_landmarks = True",
+            "is_cropped_lower_body = True",
             "pose_direction = FRONT",
             "final validation_status = PASS",
             "final validation_reason = VALID",
@@ -636,6 +639,7 @@ class MainSingleProductTests(unittest.TestCase):
 
         output = stdout.getvalue()
         for expected in (
+            "landmark_reliable = False",
             "landmarks = None",
             "person_top_ratio = 0.0000",
             "garment_top_ratio = 0.2000",

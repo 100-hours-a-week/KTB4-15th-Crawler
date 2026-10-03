@@ -70,6 +70,20 @@ def get_pending_products(connection: Any, *, limit: int | None = None) -> list[P
     return [_row_to_product(row) for row in rows]
 
 
+def get_all_products(connection: Any, *, limit: int | None = None) -> list[Product]:
+    """validation 상태와 무관하게 전체 상품을 product_code 순으로 조회한다."""
+    columns = ", ".join(_PRODUCT_COLUMNS)
+    sql = f"SELECT {columns} FROM products ORDER BY product_code"
+    params: tuple[Any, ...] = ()
+    if limit is not None:
+        sql += " LIMIT %s"
+        params = (limit,)
+    with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+    return [_row_to_product(row) for row in rows]
+
+
 def get_product_by_code(connection: Any, product_code: int) -> Product | None:
     """validation_status 와 무관하게 상품 하나를 조회한다. --product-code 디버그용이다."""
     columns = ", ".join(_PRODUCT_COLUMNS)

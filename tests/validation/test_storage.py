@@ -95,6 +95,29 @@ class GetPendingProductsTests(unittest.TestCase):
         self.assertEqual(params, (10,))
 
 
+class GetAllProductsTests(unittest.TestCase):
+    def test_returns_all_products_without_validation_status_filter(self):
+        connection = FakeConnection(rows=[_ROW])
+
+        products = storage.get_all_products(connection)
+
+        self.assertEqual([product.product_code for product in products], [1001])
+        [(sql, params)] = connection._cursor.executed
+        self.assertTrue(sql.startswith("SELECT"))
+        self.assertNotIn("validation_status", sql)
+        self.assertIn("ORDER BY product_code", sql)
+        self.assertEqual(params, ())
+
+    def test_limit_is_passed_as_a_query_parameter(self):
+        connection = FakeConnection(rows=[_ROW])
+
+        storage.get_all_products(connection, limit=10)
+
+        [(sql, params)] = connection._cursor.executed
+        self.assertIn("LIMIT", sql)
+        self.assertEqual(params, (10,))
+
+
 class GetProductByCodeTests(unittest.TestCase):
     def test_returns_the_product_when_found(self):
         connection = FakeConnection(rows=[_ROW])

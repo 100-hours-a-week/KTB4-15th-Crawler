@@ -52,6 +52,11 @@ class BodyLandmarks:
     left_ankle_visibility: float
     right_ankle_visibility: float
 
+    @property
+    def torso_scale(self) -> float:
+        """방향 판정에 쓰는 어깨-골반 간 정규화 거리다."""
+        return abs(self.hip_mid_y - self.shoulder_mid_y)
+
 
 def extract_landmarks(pose_landmarker_result) -> BodyLandmarks | None:
     """MediaPipe PoseLandmarkerResult 에서 방향 판정에 필요한 값만 뽑는다.
@@ -111,6 +116,17 @@ def has_sufficient_lower_body_landmarks(landmarks: BodyLandmarks) -> bool:
     return hips_visible and legs_visible
 
 
+def is_direction_landmark_reliable(landmarks: BodyLandmarks) -> bool:
+    """어깨 회전 기반 방향 판정에 landmark 를 사용할 수 있는지 확인한다."""
+    return (
+        landmarks.left_shoulder_visibility >= MIN_LANDMARK_VISIBILITY
+        and landmarks.right_shoulder_visibility >= MIN_LANDMARK_VISIBILITY
+        and landmarks.left_hip_visibility >= MIN_LANDMARK_VISIBILITY
+        and landmarks.right_hip_visibility >= MIN_LANDMARK_VISIBILITY
+        and landmarks.torso_scale >= MIN_TORSO_SCALE
+    )
+
+
 def classify_direction(
     landmarks: BodyLandmarks | None, *, allow_lower_body_fallback: bool = False
 ) -> PoseDirection:
@@ -135,7 +151,7 @@ def classify_direction(
             return PoseDirection.FRONT
         return PoseDirection.UNCERTAIN
 
-    torso_scale = abs(landmarks.hip_mid_y - landmarks.shoulder_mid_y)
+    torso_scale = landmarks.torso_scale
     if torso_scale < MIN_TORSO_SCALE:
         return PoseDirection.UNCERTAIN
 
@@ -202,8 +218,11 @@ class PoseEstimator:
         self, image_rgb, *, allow_lower_body_fallback: bool = False
     ) -> PoseDirection:
         """image_rgb 는 HxWx3 RGB numpy 배열이다."""
+        landmarks = self.get_landmarks(image_rgb)
+        if landmarks is None or not is_direction_landmark_reliable(landmarks):
+            return PoseDirection.UNCERTAIN
         return classify_direction(
-            self.get_landmarks(image_rgb), allow_lower_body_fallback=allow_lower_body_fallback
+            landmarks, allow_lower_body_fallback=allow_lower_body_fallback
         )
 
     def close(self) -> None:

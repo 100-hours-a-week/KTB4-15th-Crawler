@@ -6,6 +6,7 @@
 
 import unittest
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import numpy as np
 
@@ -13,6 +14,7 @@ from app.models.product import Product
 from app.validation.models import (
     Detection,
     DetectionResult,
+    PoseDirection,
     ValidationReason,
     ValidationStatus,
 )
@@ -272,20 +274,56 @@ class ValidateProductImageTests(unittest.TestCase):
 
         self.assertEqual(pose_estimator.get_landmarks_calls, 1)
 
-    def test_bottom_product_with_one_garment_enables_lower_body_fallback(self):
-        # 상체 landmark 는 부족하지만 하체 landmark 는 충분한 경우, 하의 + garment
-        # 1개 조합에서만 allow_lower_body_fallback=True 로 classify_direction 이
-        # FRONT(=PASS)를 내는지로 간접 확인한다(pose_estimator 는 이제 이 값을
-        # 직접 넘겨받지 않는다 — product_image_validator 가 classify_direction 을
-        # 직접 호출하기 때문이다).
+    def test_top_product_with_unreliable_landmarks_fails_without_classifying(self):
+        pose_estimator = FakePoseEstimator(landmarks=_UNCERTAIN_LANDMARKS)
+
+        with patch(
+            "app.validation.product_image_validator.classify_direction",
+            side_effect=AssertionError("quality BAD landmarks must not be classified"),
+        ):
+            outcome = validate_product_image(
+                _product(main_category="상의", sub_category="스웨트셔츠"),
+                detector=FakeDetector(_detection_result(persons=1, garments=1)),
+                pose_estimator=pose_estimator,
+                image_loader=_fake_image_loader,
+            )
+
+        self.assertEqual(outcome.status, ValidationStatus.FAIL)
+        self.assertEqual(outcome.reason, ValidationReason.UNCERTAIN)
+        self.assertEqual(pose_estimator.get_landmarks_calls, 1)
+
+    def test_top_product_with_reliable_landmarks_uses_direction_classification(self):
+        with patch(
+            "app.validation.product_image_validator.classify_direction",
+            return_value=PoseDirection.FRONT,
+        ) as classify:
+            outcome = validate_product_image(
+                _product(main_category="상의", sub_category="스웨트셔츠"),
+                detector=FakeDetector(_detection_result(persons=1, garments=1)),
+                pose_estimator=FakePoseEstimator(landmarks=_FRONT_LANDMARKS),
+                image_loader=_fake_image_loader,
+            )
+
+        classify.assert_called_once_with(
+            _FRONT_LANDMARKS, allow_lower_body_fallback=False
+        )
+        self.assertEqual(outcome.status, ValidationStatus.PASS)
+
+    def test_bottom_product_with_bad_landmarks_uses_bbox_fallback(self):
+        # 상체 landmark 가 부족한 하의는 classify_direction 대신 기존 bbox
+        # fallback 으로 판정한다. 기본 fake box 는 fallback 조건을 모두 만족한다.
         pose_estimator = FakePoseEstimator(landmarks=_CROPPED_UPPER_BODY_LANDMARKS)
 
-        outcome = validate_product_image(
-            _product(main_category="하의", sub_category="슬림 팬츠"),
-            detector=FakeDetector(_detection_result(persons=1, garments=1)),
-            pose_estimator=pose_estimator,
-            image_loader=_fake_image_loader,
-        )
+        with patch(
+            "app.validation.product_image_validator.classify_direction",
+            side_effect=AssertionError("quality BAD landmarks must not be classified"),
+        ):
+            outcome = validate_product_image(
+                _product(main_category="하의", sub_category="슬림 팬츠"),
+                detector=FakeDetector(_detection_result(persons=1, garments=1)),
+                pose_estimator=pose_estimator,
+                image_loader=_fake_image_loader,
+            )
 
         self.assertEqual(outcome.status, ValidationStatus.PASS)
         self.assertEqual(pose_estimator.get_landmarks_calls, 1)
@@ -303,7 +341,7 @@ class ValidateProductImageTests(unittest.TestCase):
         self.assertEqual(outcome.status, ValidationStatus.FAIL)
         self.assertEqual(outcome.reason, ValidationReason.UNCERTAIN)
 
-    def test_bottom_product_with_multiple_garments_does_not_enable_fallback(self):
+    def test_bottom_product_with_multiple_garments_fails_without_pose(self):
         pose_estimator = FakePoseEstimator(landmarks=_CROPPED_UPPER_BODY_LANDMARKS)
 
         outcome = validate_product_image(
@@ -314,11 +352,26 @@ class ValidateProductImageTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome.status, ValidationStatus.FAIL)
-        self.assertEqual(outcome.reason, ValidationReason.UNCERTAIN)
+        self.assertEqual(outcome.reason, ValidationReason.MULTIPLE_GARMENTS)
+        self.assertEqual(pose_estimator.get_landmarks_calls, 0)
+
+    def test_single_person_without_garment_fails_without_pose(self):
+        pose_estimator = FakePoseEstimator(landmarks=_FRONT_LANDMARKS)
+
+        outcome = validate_product_image(
+            _product(),
+            detector=FakeDetector(_detection_result(persons=1, garments=0)),
+            pose_estimator=pose_estimator,
+            image_loader=_fake_image_loader,
+        )
+
+        self.assertEqual(outcome.status, ValidationStatus.FAIL)
+        self.assertEqual(outcome.reason, ValidationReason.GARMENT_NOT_FOUND)
+        self.assertEqual(pose_estimator.get_landmarks_calls, 0)
 
 
 class BottomCropFallbackTests(unittest.TestCase):
-    """하의 + person1 + garment1 + MediaPipe landmarks=None 전용 bbox fallback."""
+    """하의 + person1 + garment1 + 방향 landmark 없음/품질 불량 bbox fallback."""
 
     @staticmethod
     def _detection(person_box, garment_box) -> DetectionResult:
@@ -418,24 +471,10 @@ class BottomCropFallbackTests(unittest.TestCase):
 
     def test_top_product_does_not_get_bbox_fallback_even_with_the_same_boxes(self):
         top_product = _product(main_category="상의", sub_category="스웨트셔츠")
+        pose_estimator = FakePoseEstimator(landmarks=None)
 
         outcome = validate_product_image(
             top_product,
-            detector=FakeDetector(self._detection(_CROP_PERSON_BOX_OK, _CROP_GARMENT_BOX_OK)),
-            pose_estimator=FakePoseEstimator(landmarks=None),
-            image_loader=self._crop_image_loader,
-        )
-
-        self.assertEqual(outcome.status, ValidationStatus.FAIL)
-        self.assertEqual(outcome.reason, ValidationReason.UNCERTAIN)
-
-    def test_landmarks_present_uses_existing_pose_result_not_bbox(self):
-        # landmarks 가 있으면(None 이 아니면) bbox 를 아예 계산하지 않고 classify_direction
-        # 결과(여기서는 UNCERTAIN)를 그대로 쓴다 — bbox 조건은 전부 만족하는 box 를 줘도.
-        pose_estimator = FakePoseEstimator(landmarks=_UNCERTAIN_LANDMARKS)
-
-        outcome = validate_product_image(
-            self._bottom_product(),
             detector=FakeDetector(self._detection(_CROP_PERSON_BOX_OK, _CROP_GARMENT_BOX_OK)),
             pose_estimator=pose_estimator,
             image_loader=self._crop_image_loader,
@@ -443,6 +482,55 @@ class BottomCropFallbackTests(unittest.TestCase):
 
         self.assertEqual(outcome.status, ValidationStatus.FAIL)
         self.assertEqual(outcome.reason, ValidationReason.UNCERTAIN)
+        self.assertEqual(pose_estimator.get_landmarks_calls, 1)
+
+    def test_unreliable_landmarks_present_uses_bbox_fallback(self):
+        # landmarks 가 있어도 quality BAD 면 방향 판정을 건너뛰고 기존 bbox fallback 을 쓴다.
+        pose_estimator = FakePoseEstimator(landmarks=_UNCERTAIN_LANDMARKS)
+
+        with patch(
+            "app.validation.product_image_validator.classify_direction",
+            side_effect=AssertionError("quality BAD landmarks must not be classified"),
+        ):
+            outcome = validate_product_image(
+                self._bottom_product(),
+                detector=FakeDetector(
+                    self._detection(_CROP_PERSON_BOX_OK, _CROP_GARMENT_BOX_OK)
+                ),
+                pose_estimator=pose_estimator,
+                image_loader=self._crop_image_loader,
+            )
+
+        self.assertEqual(outcome.status, ValidationStatus.PASS)
+        self.assertEqual(outcome.reason, ValidationReason.VALID)
+        self.assertEqual(pose_estimator.get_landmarks_calls, 1)
+
+    def test_reliable_landmarks_use_direction_instead_of_bbox_fallback(self):
+        pose_estimator = FakePoseEstimator(landmarks=_FRONT_LANDMARKS)
+
+        with (
+            patch(
+                "app.validation.product_image_validator.classify_direction",
+                return_value=PoseDirection.FRONT,
+            ) as classify,
+            patch(
+                "app.validation.product_image_validator.check_cropped_lower_body",
+                side_effect=AssertionError("quality OK landmarks must not use bbox fallback"),
+            ),
+        ):
+            outcome = validate_product_image(
+                self._bottom_product(),
+                detector=FakeDetector(
+                    self._detection(_CROP_PERSON_BOX_OK, _CROP_GARMENT_BOX_OK)
+                ),
+                pose_estimator=pose_estimator,
+                image_loader=self._crop_image_loader,
+            )
+
+        classify.assert_called_once_with(
+            _FRONT_LANDMARKS, allow_lower_body_fallback=True
+        )
+        self.assertEqual(outcome.status, ValidationStatus.PASS)
         self.assertEqual(pose_estimator.get_landmarks_calls, 1)
 
     def test_get_landmarks_is_called_exactly_once_even_when_landmarks_are_none(self):

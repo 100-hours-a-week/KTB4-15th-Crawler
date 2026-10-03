@@ -1,6 +1,7 @@
 """landmark 좌표만으로 방향 판정 로직을 검증한다. MediaPipe 모델은 로드하지 않는다."""
 
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
@@ -14,6 +15,7 @@ from app.validation.pose import (
     extract_landmarks,
     has_sufficient_lower_body_landmarks,
     has_sufficient_upper_body_landmarks,
+    is_direction_landmark_reliable,
 )
 
 _VISIBLE = 0.95
@@ -188,6 +190,29 @@ class HasSufficientLowerBodyLandmarksTests(unittest.TestCase):
             hip_visibility=_VISIBLE, knee_visibility=_HIDDEN, ankle_visibility=_HIDDEN
         )
         self.assertFalse(has_sufficient_lower_body_landmarks(landmarks))
+
+
+class DirectionLandmarkReliabilityTests(unittest.TestCase):
+    def test_visible_shoulders_and_hips_with_normal_torso_are_reliable(self):
+        self.assertTrue(is_direction_landmark_reliable(_landmarks()))
+
+    def test_each_low_shoulder_or_hip_visibility_is_unreliable(self):
+        reliable = _landmarks()
+        for field in (
+            "left_shoulder_visibility",
+            "right_shoulder_visibility",
+            "left_hip_visibility",
+            "right_hip_visibility",
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(
+                    is_direction_landmark_reliable(replace(reliable, **{field: _HIDDEN}))
+                )
+
+    def test_torso_scale_below_minimum_is_unreliable(self):
+        landmarks = replace(_landmarks(), hip_mid_y=0.01)
+
+        self.assertFalse(is_direction_landmark_reliable(landmarks))
 
 
 class BottomWearLowerBodyFallbackTests(unittest.TestCase):
