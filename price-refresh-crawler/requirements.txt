@@ -1,1 +1,2 @@
-# Python 3.9+ standard library only. No third-party runtime or test dependencies.
+# Match the AI repository's psycopg version. No pool needed for one-shot reads.
+psycopg[binary]==3.3.5
