@@ -16,6 +16,8 @@ from price_refresh.settings import Settings
 from price_refresh.source.categories import CATEGORIES
 from price_refresh.source.fixture_client import FixtureClient
 from price_refresh.writer import PostgresApplySession
+from price_refresh.delivery import BackendDelivery
+from test_delivery import FakeBackend, response
 
 TEST_URL = os.getenv("PRICE_REFRESH_TEST_DATABASE_URL", "")
 
@@ -175,6 +177,62 @@ class PostgresApplyTests(unittest.TestCase):
         self.assertEqual(report.status, "completed")
         self.assertEqual(report.saved_changes[0].product_code, code)
         self.assertEqual(self.prices()[int(code)], price)
+
+    def test_real_committed_recommended_only_delivery_retry_retains_lock(self):
+        self.admin.execute("UPDATE products SET has_been_recommended=TRUE WHERE product_code IN (1,2)")
+        session = self.session()
+
+        def during_http(_):
+            self.assertEqual(session.connection.info.transaction_status, 0)
+            self.assertEqual(self.prices(), {1: 200, 2: 100, 3: 200})
+            competitor = self.session()
+            self.assertFalse(competitor.open())
+            competitor.close()
+
+        client = FakeBackend([response(["1"], failed=["1"])], on_send=during_http)
+        report = run_apply(session, lambda: ScanResult(prices={"1": 200, "2": 999, "3": 200}),
+                           delivery=BackendDelivery(client))
+        self.assertEqual([change.product_code for change in report.saved_changes], ["1", "3"])
+        self.assertEqual([[p["product_code"] for p in batch] for batch in client.calls], [["1"], ["1"]])
+        self.assertEqual(report.backend["successful_count"], 1)
+        self.assertEqual(report.backend["retry_success_count"], 1)
+
+    def test_real_missing_recommendation_column_skips_delivery_keeps_commits(self):
+        self.admin.execute("ALTER TABLE products DROP COLUMN has_been_recommended")
+        client = FakeBackend()
+        report = run_apply(self.session(), lambda: ScanResult(prices={"1": 200}),
+                           delivery=BackendDelivery(client))
+        self.assertEqual(report.status, "partial_failure")
+        self.assertEqual(self.prices()[1], 200)
+        self.assertEqual(client.calls, [])
+        self.assertEqual(report.backend["error"], "recommendation_column_missing")
+        self.assertIsNone(report.backend["target_count"])
+
+    def test_real_terminated_lock_after_first_delivery_blocks_retry(self):
+        self.admin.execute("UPDATE products SET has_been_recommended=TRUE WHERE product_code=1")
+        session = self.session()
+
+        def terminate(_):
+            self.admin.execute("SELECT pg_terminate_backend(%s)", (session.backend_pid,))
+
+        client = FakeBackend([response(["1"], failed=["1"])], on_send=terminate)
+        report = run_apply(session, lambda: ScanResult(prices={"1": 200}), delivery=BackendDelivery(client))
+        self.assertEqual(report.status, "aborted")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(report.backend["retry_request_count"], 0)
+        self.assertEqual(report.backend["failed_count"], 1)
+        self.assertEqual(self.prices()[1], 200)
+
+    def test_real_batched_recommendation_lookup_on_autocommit_session(self):
+        self.admin.execute("UPDATE products SET has_been_recommended=TRUE WHERE product_code IN (1,3)")
+        session = self.session()
+        session.settings = DatabaseSettings(TEST_URL, recommendation_batch_size=2)
+        client = FakeBackend()
+        report = run_apply(session, lambda: ScanResult(prices={"1": 200, "2": 200, "3": 200}),
+                           delivery=BackendDelivery(client))
+        self.assertEqual(report.status, "completed")
+        self.assertEqual([[p["product_code"] for p in batch] for batch in client.calls], [["1", "3"]])
+        self.assertEqual(report.backend["target_count"], 2)
 
 
 if __name__ == "__main__":

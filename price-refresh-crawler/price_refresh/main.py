@@ -1,4 +1,4 @@
-"""CLI for collected prices and read-only price comparison previews."""
+"""CLI for collected prices, read-only previews, and explicit apply + delivery."""
 
 import argparse
 import json
@@ -15,6 +15,8 @@ from .dry_run import run_dry_run
 from .apply import run_apply
 from .writer import PostgresApplySession
 from .logging_config import configure_logging
+from .backend import BackendClient, BackendError, BackendSettings
+from .delivery import BackendDelivery
 from .repository import (
     DatabaseSettings, FixturePriceRepository, PostgresPriceRepository, RepositoryError,
 )
@@ -56,8 +58,11 @@ def main(argv=None) -> int:
         else:
             collect = lambda: collect_prices(TwentyNineCmClient(settings), categories, settings)
         if args.apply:
+            # Mandatory preflight: no DB connection/price write with missing or
+            # invalid backend URL/auth/batch/timeout configuration.
+            backend = BackendDelivery(BackendClient(BackendSettings.from_env()))
             report = run_apply(PostgresApplySession(DatabaseSettings.from_env()), collect,
-                               emit=lambda payload: write_json(payload, args.output))
+                               emit=lambda payload: write_json(payload, args.output), delivery=backend)
             return 0 if report.status in {"completed", "skipped_concurrent"} else 1
         if args.dry_run:
             repository = (FixturePriceRepository(args.stored_products_fixture)
@@ -72,7 +77,10 @@ def main(argv=None) -> int:
         write_json(payload, args.output)
         return 1 if failed else 0
     except RepositoryError as error:
-        logging.error("dry_run_failed code=%s", error.code)
+        logging.error("database_configuration_or_read_failed code=%s", error.code)
+        return 1
+    except BackendError as error:
+        logging.error("backend_configuration_failed code=%s", error.code)
         return 1
     except (OSError, ValueError) as error:
         logging.error("execution_failed error=%s", error)

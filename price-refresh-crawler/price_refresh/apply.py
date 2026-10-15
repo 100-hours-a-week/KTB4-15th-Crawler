@@ -1,4 +1,4 @@
-"""Apply orchestration. No recommendation gate, backend calls or persistent queue."""
+"""Apply prices, then deliver committed recommended changes under the same lock."""
 
 import logging
 import time
@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from .comparison import compare_prices, normalize_code, valid_price
 from .writer import ApplyError, CommitUnknown, SessionLost
+from .delivery import DeliveryReport
 
 logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9), "KST")
@@ -32,6 +33,7 @@ class ApplyReport:
     scan_error_count: int = 0
     invalid_stored_row_count: int = 0
     error: object = None
+    backend: object = None
 
     def to_dict(self):
         result = asdict(self)
@@ -40,7 +42,7 @@ class ApplyReport:
         return result
 
 
-def run_apply(session, collect, *, emit=None):
+def run_apply(session, collect, *, emit=None, delivery=None):
     """Emit results and log summary BEFORE releasing the session lock.
 
     collect must finish finalizing all observed maxima before any write starts.
@@ -85,11 +87,16 @@ def run_apply(session, collect, *, emit=None):
                     report.failed_products.append({"product_code": active_code, "error": result.error})
                     logger.error("apply_product_failed code=%s error=%s", active_code, result.error)
                 active_code = None
-            # Stage 5 can use report.saved_changes HERE, under this same lock.
-            # No recommendation lookup or backend delivery is performed in stage 4.
+            session.assert_lock()
+            if delivery is not None:
+                result = delivery.deliver(session, report.saved_changes)
+                report.backend = result.to_dict()
+                if result.status == "aborted":
+                    raise SessionLost(result.error)
             session.assert_lock()
             report.status = ("partial_failure" if report.failed_products or report.scan_error_count
-                             or report.missing_count else "completed")
+                             or report.missing_count or (report.backend and report.backend["status"]
+                                 in {"partial_failure", "recommendation_lookup_failed"}) else "completed")
     except CommitUnknown as error:
         report.error = error.code
         report.unknown_products.append({"product_code": active_code, "error": error.code})
@@ -104,6 +111,11 @@ def run_apply(session, collect, *, emit=None):
         logger.error("apply_aborted code=%s", report.error)
     finally:
         try:
+            if delivery is not None and report.backend is None:
+                reason = ("skipped_concurrent" if report.status == "skipped_concurrent"
+                          else "skipped_apply_aborted")
+                report.backend = DeliveryReport(status=reason, skip_reason=reason).to_dict()
+                logger.info("backend_skipped reason=%s", reason)
             if emit is not None:
                 try:
                     emit(report.to_dict())

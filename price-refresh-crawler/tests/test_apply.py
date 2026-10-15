@@ -6,6 +6,7 @@ import logging
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 from price_refresh.apply import run_apply
 from price_refresh.logging_config import KstFormatter
@@ -38,6 +39,9 @@ class FakeConnection:
         self.commit_errors = []
         self.before_commit = None
         self.initial_rows = None
+        self.flags = {}
+        self.autocommit = True
+        self.info = SimpleNamespace(transaction_status=0)
 
     @contextmanager
     def cursor(self):
@@ -62,6 +66,9 @@ class FakeConnection:
                 elif sql == "SELECT product_code, price FROM products":
                     self.value = (connection.initial_rows if connection.initial_rows is not None
                                   else list(connection.prices.items()))
+                elif sql.startswith("SELECT product_code, has_been_recommended"):
+                    self.value = [(code, connection.flags.get(code, False)) for code in params[0]
+                                  if code in connection.prices]
                 elif "FOR UPDATE" in sql:
                     self.value = ((connection.prices[params[0]],)
                                   if params[0] in connection.prices else None)
@@ -86,6 +93,7 @@ class FakeConnection:
     @contextmanager
     def transaction(self):
         snapshot = self.prices.copy()
+        self.info.transaction_status = 2
         try:
             yield
         except BaseException:
@@ -102,6 +110,8 @@ class FakeConnection:
                     self.prices = snapshot
                 raise error
             self.commits += 1
+        finally:
+            self.info.transaction_status = 0
 
     def rollback(self):
         self.rollbacks += 1
@@ -318,6 +328,7 @@ class ApplyCliTests(unittest.TestCase):
         session, _ = make_session(connection)
         with patch("price_refresh.main.PostgresApplySession", return_value=session), \
                 patch("price_refresh.main.DatabaseSettings.from_env"), \
+                patch("price_refresh.main.BackendSettings.from_env"), \
                 patch("price_refresh.main.collect_prices", return_value=ScanResult(prices={"1": 200})), \
                 redirect_stdout(io.StringIO()) as output:
             self.assertEqual(main(["--apply", "--category-limit", "1"]), 0)

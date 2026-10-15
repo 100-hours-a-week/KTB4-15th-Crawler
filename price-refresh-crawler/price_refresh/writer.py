@@ -4,7 +4,8 @@ import logging
 import re
 from dataclasses import dataclass
 
-from .comparison import PriceChange, normalize_code, valid_price
+from .comparison import PriceChange, code_order, normalize_code, valid_price
+from .repository import RepositoryError, recommendation_rows
 
 logger = logging.getLogger(__name__)
 # One fixed bigint key for ALL apply runs (ASCII PRICEREF).
@@ -100,6 +101,43 @@ class PostgresApplySession:
                 return cursor.fetchall()
         except Exception:
             raise ApplyError("initial_price_read_failed") from None
+
+    def assert_delivery_ready(self):
+        self.assert_lock()
+        # psycopg.pq.TransactionStatus.IDLE == 0. No open transaction may span HTTP.
+        if not self.connection.autocommit or self.connection.info.transaction_status != 0:
+            raise SessionLost("delivery_transaction_not_idle")
+
+    def fetch_recommendations(self, product_codes):
+        codes = sorted(set(product_codes), key=code_order)
+        if not codes:
+            return {}
+        if any(normalize_code(code) != code or len(code) > 19
+               or int(code) > 9223372036854775807 for code in codes):
+            raise RepositoryError("invalid_product_code")
+        rows = []
+        try:
+            size = self.settings.recommendation_batch_size
+            for start in range(0, len(codes), size):
+                self.assert_delivery_ready()
+                with self.connection.cursor() as cursor:
+                    cursor.execute("SELECT product_code, has_been_recommended FROM products "
+                                   "WHERE product_code = ANY(%s)",
+                                   ([int(code) for code in codes[start:start + size]],))
+                    rows.extend(cursor.fetchall())
+            self.assert_delivery_ready()
+            return recommendation_rows(rows, codes)
+        except SessionLost:
+            raise
+        except Exception as error:
+            # Autocommit SELECT failures leave no long-running/failed transaction.
+            # A lost lock connection is fatal, not an ordinary recommendation failure.
+            self.assert_delivery_ready()
+            if isinstance(error, RepositoryError):
+                raise
+            code = ("recommendation_column_missing" if sqlstate(error) == "42703"
+                    else "recommendation_lookup_failed")
+            raise RepositoryError(code) from None
 
     def write_one(self, code, new_price):
         if (not isinstance(code, str) or normalize_code(code) != code or len(code) > 19
