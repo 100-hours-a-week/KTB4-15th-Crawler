@@ -25,7 +25,6 @@ def product_code(item: Any) -> Optional[str]:
     if type(value) is int and value > 0:
         return str(value)
     if type(value) is str and re.fullmatch(r"[0-9]+", value):
-        # Avoid int conversion limits for unusually long identifiers.
         normalized = value.lstrip("0")
         return normalized or None
     return None
@@ -38,5 +37,4 @@ def display_price(item: Any) -> Optional[int]:
     if not isinstance(info, Mapping):
         return None
     price = info.get("displayPrice")
-    # bool, float (even 1.0), numeric strings and null are not integer KRW.
     return price if type(price) is int and price >= 0 else None
