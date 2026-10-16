@@ -1,0 +1,2 @@
+# Match the AI repository's psycopg version. No pool needed for one-shot reads.
+psycopg[binary]==3.3.5

@@ -1,0 +1,75 @@
+{
+  "data": {
+    "list": [
+      {
+        "itemId": 3263645,
+        "itemUrl": {"webLink": "https://product.29cm.co.kr/catalog/3263645"},
+        "itemInfo": {
+          "productName": "Jacquard Stripe Roll Up Half Shirts White",
+          "thumbnailUrl": "https://img.29cm.co.kr/item/example.jpg",
+          "displayPrice": 31430,
+          "isSoldOut": false,
+          "itemGroup": {"colors": [{"code": "#FFF7DE", "name": "아이보리"}, {"code": "#000000", "name": "블랙"}]}
+        },
+        "itemEvent": {
+          "eventProperties": {
+            "middleCategoryName": "상의",
+            "smallCategoryName": "반소매 셔츠",
+            "isColorchip": true,
+            "productName": "이벤트용 상품명",
+            "thumbnailUrl": "https://img.29cm.co.kr/item/event-example.jpg",
+            "displayPrice": 99999,
+            "isSoldOut": true
+          }
+        }
+      },
+      {
+        "itemId": 3263646,
+        "itemUrl": {"webLink": "https://product.29cm.co.kr/catalog/3263646"},
+        "itemInfo": {
+          "productName": "Half Shirts White",
+          "thumbnailUrl": "https://img.29cm.co.kr/item/example-white.jpg",
+          "displayPrice": 32000,
+          "isSoldOut": false,
+          "itemGroup": {"colors": [{"name": "블랙"}]}
+        },
+        "itemEvent": {"eventProperties": {"middleCategoryName": "상의", "smallCategoryName": "반소매 셔츠", "isColorchip": false}}
+      },
+      {
+        "itemId": 3263647,
+        "itemUrl": {"webLink": "https://product.29cm.co.kr/catalog/3263647"},
+        "itemInfo": {
+          "productName": "Half Shirts Black",
+          "thumbnailUrl": "https://img.29cm.co.kr/item/example-black.jpg",
+          "displayPrice": 29000,
+          "isSoldOut": true
+        },
+        "itemEvent": {"eventProperties": {"middleCategoryName": "상의", "smallCategoryName": "반소매 셔츠", "isColorchip": false}}
+      },
+      {
+        "itemId": 3263648,
+        "itemUrl": {"webLink": "https://product.29cm.co.kr/catalog/3263648"},
+        "itemInfo": {
+          "productName": "Jacquard Stripe Roll Up Half Shirts",
+          "thumbnailUrl": "https://img.29cm.co.kr/item/example-stripe.jpg",
+          "displayPrice": 35000,
+          "isSoldOut": false,
+          "itemGroup": {"colors": []}
+        },
+        "itemEvent": {"eventProperties": {"middleCategoryName": "상의", "smallCategoryName": "반소매 셔츠", "isColorchip": false}}
+      },
+      {
+        "itemId": 3263649,
+        "itemUrl": {"webLink": "https://product.29cm.co.kr/catalog/3263649"},
+        "itemInfo": {
+          "productName": "Half Shirts Navy",
+          "thumbnailUrl": "https://img.29cm.co.kr/item/example-navy.jpg",
+          "displayPrice": 33000,
+          "isSoldOut": false,
+          "itemGroup": {}
+        },
+        "itemEvent": {"eventProperties": {"middleCategoryName": "상의", "smallCategoryName": "반소매 셔츠", "isColorchip": true}}
+      }
+    ]
+  }
+}

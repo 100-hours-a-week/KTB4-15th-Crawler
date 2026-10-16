@@ -1,0 +1,12 @@
+{
+  "products": [
+    {"product_code": 3263645, "price": 40000},
+    {"product_code": "003263646", "price": 30000},
+    {"product_code": 3263647, "price": 29000},
+    {"product_code": 9999999, "price": 10000}
+  ],
+  "recommendations": [
+    {"product_code": 3263645, "has_been_recommended": true},
+    {"product_code": "3263646", "has_been_recommended": false}
+  ]
+}
