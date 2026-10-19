@@ -13,11 +13,10 @@ run-name: >-
       || format('Price refresh dev rollback - {0}', inputs.image_tag) }}
 
 on:
+  # paths 필터를 두지 않는다. 필수 체크로 쓸 때 문서만 바뀐 커밋에서 실행되지 않으면
+  # PR이 체크를 계속 기다리게 된다 (BE dev CD와 같은 규칙).
   push:
     branches: ["develop", "hotfix/**"]
-    paths:
-      - "price-refresh-crawler/**"
-      - ".github/workflows/price-refresh-dev-cd.yml"
 
   # 이미 ECR에 있는 이미지로 revision을 다시 등록할 때(롤백) 사용한다.
   workflow_dispatch:
