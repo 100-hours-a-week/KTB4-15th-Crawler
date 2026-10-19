@@ -4,13 +4,11 @@
 # - CD와 같은 ARM 러너·같은 Dockerfile을 써서 "CI 통과 = 배포 이미지 빌드 가능"이 되게 한다.
 name: Price refresh CI
 
+# paths 필터를 두지 않는다. 이 체크를 브랜치 보호의 필수 체크로 쓰면
+# 해당 경로가 안 바뀐 PR에서는 실행되지 않아 체크를 계속 기다리게 된다 (BE·AI와 같은 규칙).
 on:
   pull_request:
     branches: ["develop", "main"]
-    paths:
-      - "price-refresh-crawler/**"
-      - ".github/workflows/price-refresh-ci.yml"
-      - ".github/workflows/price-refresh-dev-cd.yml"
 
 permissions:
   contents: read
