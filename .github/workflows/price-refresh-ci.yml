@@ -1,0 +1,43 @@
+# 가격 갱신 크롤러 CI (PR 검증)
+# - AI 레포 CI와 같은 방식: Dockerfile의 test 단계까지만 빌드한다 (push 없음, AWS 인증 없음).
+#   test 단계가 의존성 설치 + unittest를 실행하므로 테스트가 실패하면 CI가 실패한다.
+# - CD와 같은 ARM 러너·같은 Dockerfile을 써서 "CI 통과 = 배포 이미지 빌드 가능"이 되게 한다.
+name: Price refresh CI
+
+on:
+  pull_request:
+    branches: ["develop", "main"]
+    paths:
+      - "price-refresh-crawler/**"
+      - ".github/workflows/price-refresh-ci.yml"
+      - ".github/workflows/price-refresh-dev-cd.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: price-refresh-ci-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: price-refresh-ci
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Buildx 준비
+        uses: docker/setup-buildx-action@v3
+
+      - name: 빌드 및 테스트 (Dockerfile test 단계)
+        uses: docker/build-push-action@v6
+        with:
+          context: price-refresh-crawler
+          file: price-refresh-crawler/Dockerfile
+          target: test
+          platforms: linux/arm64
+          push: false
+          cache-from: type=gha,scope=price-refresh
+          cache-to: type=gha,mode=max,scope=price-refresh
