@@ -1,4 +1,6 @@
-"""Opt-in four-case LOCAL DB test; restore all sampled prices and flags.
+"""Opt-in four-case LOCAL DB test; restore sampled prices/flags and delete this run's outbox rows.
+
+Requires price_change_outbox in the local DB (run_apply's preflight stops otherwise).
 
 Run from price-refresh-crawler:
   python3 -B tests/manual_recommendation_filter.py --docker --run-local
@@ -13,17 +15,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from manual_timing import IMAGE, inspect_local_db, protected_hashes, read_host_db_config
 from price_refresh.apply import run_apply
-from price_refresh.backend import BackendClient, BackendSettings, ENDPOINT, SUCCESS
-from price_refresh.delivery import BackendDelivery
+from price_refresh.backend import BackendClient
 from price_refresh.logging_config import configure_logging
 from price_refresh.repository import DatabaseSettings
 from price_refresh.scanner import ScanResult
@@ -44,62 +45,10 @@ def deny_real_http(attempts):
     with ExitStack() as stack:
         for cls, method in ((http.client.HTTPConnection, "connect"),
                             (http.client.HTTPSConnection, "connect"),
-                            (http.client.HTTPConnection, "request")):
+                            (http.client.HTTPConnection, "request"),
+                            (BackendClient, "send")):
             stack.enter_context(patch.object(cls, method, deny))
         yield
-
-
-class RecordingConnection:
-    """In-memory transport; the REAL BackendClient still serializes/parses JSON."""
-
-    def __init__(self, session, requests):
-        self.session, self.requests = session, requests
-        self.closed = False
-        self.read_timeout = None
-        self.sock = SimpleNamespace(settimeout=self.settimeout)
-
-    def settimeout(self, value):
-        self.read_timeout = value
-
-    def connect(self):
-        self.session.assert_delivery_ready()
-
-    def request(self, method, path, *, body, headers):
-        self.session.assert_delivery_ready()
-        with self.session.connection.cursor() as cursor:
-            cursor.execute("SELECT product_code, price, has_been_recommended FROM products "
-                           "WHERE product_code = ANY(%s) ORDER BY product_code",
-                           ([int(row["product_code"]) for row in self.session.originals],))
-            actual = [(str(code), price, flag) for code, price, flag in cursor.fetchall()]
-        expected = [(row["product_code"], row["price"] + (1 if index < 2 else 0), index in (0, 2))
-                    for index, row in enumerate(self.session.originals)]
-        require(actual == expected, "unexpected_database_state_before_send")
-        require(self.read_timeout == 20, "unexpected_read_timeout")
-        require(headers.get("Content-Type") == "application/json", "missing_json_header")
-        self.body = json.loads(body.decode("utf-8"))
-        self.requests.append({"method": method, "path": path, "body": self.body})
-
-    def getresponse(self):
-        payload = {"code": SUCCESS, "message": "SIMULATED test response", "data": {
-            "received_count": len(self.body["products"]),
-            "failed_product_codes": [], "not_found_product_codes": []}}
-
-        class Response:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_):
-                pass
-
-            def read(self):
-                return json.dumps(payload).encode("utf-8")
-
-        return Response()
-
-    def close(self):
-        self.closed = True
 
 
 class RestoringLocalSession(PostgresApplySession):
@@ -109,8 +58,14 @@ class RestoringLocalSession(PostgresApplySession):
         super().__init__(DatabaseSettings(url))
         self.backup_file = backup_file
         self.originals = []
+        self.scan_run_id = None
+        self.outbox_rows = []
         self.restored = False
         self.restore_error = None
+
+    def write_one(self, code, new_price, scan_run_id):
+        self.scan_run_id = scan_run_id
+        return super().write_one(code, new_price, scan_run_id)
 
     def open(self):
         if not super().open():
@@ -147,6 +102,14 @@ class RestoringLocalSession(PostgresApplySession):
                 self.assert_lock()
                 with self.connection.transaction():
                     with self.connection.cursor() as cursor:
+                        if self.scan_run_id is not None:
+                            run_id = uuid.UUID(self.scan_run_id)
+                            cursor.execute("SELECT product_code, original_old_price, old_price, new_price, "
+                                           "status FROM price_change_outbox WHERE scan_run_id = %s "
+                                           "ORDER BY id", (run_id,))
+                            self.outbox_rows = [(str(code), *rest) for code, *rest in cursor.fetchall()]
+                            # Rows reference products; remove them before restoring prices.
+                            cursor.execute("DELETE FROM price_change_outbox WHERE scan_run_id = %s", (run_id,))
                         for index, row in enumerate(self.originals):
                             cursor.execute("SELECT price, has_been_recommended FROM products "
                                            "WHERE product_code = %s FOR UPDATE", (int(row["product_code"]),))
@@ -175,42 +138,26 @@ def run_local(url, result_dir):
     inspection = inspect_local_db(url)
     require(inspection["ready"], "local_db_preflight_failed")
     session = RestoringLocalSession(url, result_dir / "original_rows.json")
-    requests, connections, network_attempts = [], [], []
-
-    def factory(host, *, port, timeout):
-        require((host, port, timeout) == ("backend-disabled.invalid", None, 5), "unexpected_backend_config")
-        connection = RecordingConnection(session, requests)
-        connections.append(connection)
-        return connection
-
-    client = BackendClient(BackendSettings("https://backend-disabled.invalid", {"X-Test-Only": "local"}),
-                           connection_factory=factory)
+    network_attempts = []
     started = time.perf_counter()
     with deny_real_http(network_attempts):
-        report = run_apply(session, session.simulated_collection, delivery=BackendDelivery(client))
+        report = run_apply(session, session.simulated_collection)
     require(session.restored, session.restore_error or "original_rows_not_restored")
     require(session.connection.closed and not session.acquired, "session_not_closed")
     require(report.status == "completed", "apply_not_completed")
     a, b, c, d = session.originals
-    expected_product = {"product_code": a["product_code"], "old_price": a["price"],
-                        "new_price": a["price"] + 1}
-    expected_request = {"method": "PATCH", "path": ENDPOINT,
-                        "body": {"changed_count": 1, "products": [expected_product]}}
-    require(requests == [expected_request], "unexpected_request_body_or_count")
+    require(session.outbox_rows == [(a["product_code"], a["price"], a["price"], a["price"] + 1, "PENDING")],
+            "unexpected_outbox_rows")
     require({change.product_code for change in report.saved_changes} == {a["product_code"], b["product_code"]},
             "unexpected_saved_products")
-    require(report.backend["target_count"] == 1 and report.backend["retry_request_count"] == 0,
-            "unexpected_delivery_result")
-    require(not network_attempts and all(connection.closed for connection in connections),
-            "network_or_cleanup_failure")
+    require(not network_attempts, "network_attempted")
     names = ("changed_recommended", "changed_not_recommended", "same_recommended", "same_not_recommended")
     cases = [{"case": name, "product_code": row["product_code"], "test_recommended": index in (0, 2),
-              "price_changed": index < 2, "saved": index < 2, "included_in_request": index == 0}
+              "price_changed": index < 2, "saved": index < 2, "outbox_record": index == 0}
              for index, (name, row) in enumerate(zip(names, session.originals))]
     return {"status": "passed", "scope": "local_db_functional_test_not_crawl_timing",
             "cases": cases, "local_price_commits_before_restore": len(report.saved_changes),
-            "recommended_delivery_target_count": report.backend["target_count"],
-            "captured_requests": requests, "acknowledgements_are_simulated": True,
+            "outbox_records_before_cleanup": len(session.outbox_rows),
             "actual_29cm_requests": 0, "actual_backend_http_requests": 0,
             "blocked_http_attempts": len(network_attempts), "original_prices_and_flags_restored": session.restored,
             "session_closed": session.connection.closed, "lock_released": not session.acquired,

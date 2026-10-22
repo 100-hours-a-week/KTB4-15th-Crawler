@@ -4,13 +4,17 @@ import io
 import json
 import logging
 import unittest
+import uuid
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
+from price_refresh import outbox
 from price_refresh.apply import run_apply
 from price_refresh.logging_config import KstFormatter
 from price_refresh.main import main
+from price_refresh.readiness import ReadinessError, ReadinessIssue
 from price_refresh.repository import DatabaseSettings
 from price_refresh.scanner import ScanResult
 from price_refresh.writer import PostgresApplySession
@@ -40,6 +44,10 @@ class FakeConnection:
         self.before_commit = None
         self.initial_rows = None
         self.flags = {}
+        self.outbox = []
+        self.outbox_errors = {}
+        self.readiness = []
+        self.readiness_calls = 0
         self.autocommit = True
         self.info = SimpleNamespace(transaction_status=0)
 
@@ -70,8 +78,21 @@ class FakeConnection:
                     self.value = [(code, connection.flags.get(code, False)) for code in params[0]
                                   if code in connection.prices]
                 elif "FOR UPDATE" in sql:
-                    self.value = ((connection.prices[params[0]],)
+                    self.value = ((connection.prices[params[0]], connection.flags.get(params[0], False))
                                   if params[0] in connection.prices else None)
+                elif sql.startswith("INSERT INTO public.price_change_outbox"):
+                    run_id, code, original_old, old, new = params
+                    if code in connection.outbox_errors:
+                        raise connection.outbox_errors[code]
+                    now = datetime(2026, 10, 22, tzinfo=timezone.utc)
+                    values = dict(id=len(connection.outbox) + 1, scan_run_id=run_id, product_code=code,
+                                  original_old_price=original_old, old_price=old, new_price=new,
+                                  status="PENDING", attempt_count=0, next_attempt_at=now,
+                                  last_attempt_at=None, last_backend_price=None, last_http_status=None,
+                                  last_error_code=None, last_error_message=None, created_at=now,
+                                  updated_at=now, completed_at=None)
+                    connection.outbox.append(tuple(values[name] for name in outbox.COLUMNS))
+                    self.value = connection.outbox[-1]
                 elif sql.startswith("UPDATE products SET price"):
                     price, code = params
                     connection.updates.append(code)
@@ -92,12 +113,12 @@ class FakeConnection:
 
     @contextmanager
     def transaction(self):
-        snapshot = self.prices.copy()
+        snapshot, outbox_snapshot = self.prices.copy(), list(self.outbox)
         self.info.transaction_status = 2
         try:
             yield
         except BaseException:
-            self.prices = snapshot
+            self.prices, self.outbox = snapshot, outbox_snapshot
             self.rollbacks += 1
             raise
         else:
@@ -107,7 +128,7 @@ class FakeConnection:
             if error:
                 # A network COMMIT failure intentionally leaves outcome ambiguous.
                 if getattr(error, "sqlstate", None) not in {None, "08006", "40003"}:
-                    self.prices = snapshot
+                    self.prices, self.outbox = snapshot, outbox_snapshot
                 raise error
             self.commits += 1
         finally:
@@ -121,9 +142,20 @@ class FakeConnection:
         self.closed = True
 
 
+def fake_readiness(connection):
+    # Runs only on the locked session, before the initial product read.
+    connection.readiness_calls += 1
+    assert connection.locked and "pg_locks" in connection.statements[-1][0]
+    assert not any(sql.startswith("SELECT product_code, price") for sql, _ in connection.statements)
+    if isinstance(connection.readiness, Exception):
+        raise connection.readiness
+    return connection.readiness
+
+
 def make_session(connection):
     connect = Mock(return_value=connection)
-    session = PostgresApplySession(DatabaseSettings("postgresql://unused/unused"), connect=connect)
+    session = PostgresApplySession(DatabaseSettings("postgresql://unused/unused"), connect=connect,
+                                   readiness=fake_readiness)
     return session, connect
 
 
@@ -155,14 +187,15 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(len(connection.statements), 1)
         self.assertTrue(connection.closed)
 
-    def test_fresh_old_price_rise_fall_zero_and_no_recommendation_dependency(self):
+    def test_fresh_old_price_rise_fall_zero_and_false_flag_writes_price_only(self):
         connection = FakeConnection({1: 100, 2: 100, 3: 100})
         report = self.run_case(connection, {"1": 200, "2": 50, "3": 0},
                                after_read=lambda: connection.prices.update({1: 150}))
         self.assertEqual([(c.product_code, c.old_price, c.new_price) for c in report.saved_changes],
                          [("1", 150, 200), ("2", 100, 50), ("3", 100, 0)])
         self.assertEqual(connection.commits, 3)
-        self.assertFalse(any("recommended" in sql for sql, _ in connection.statements))
+        self.assertEqual((connection.outbox, report.outbox_records), ([], []))
+        self.assertEqual(report.to_dict()["outbox_record_count"], 0)
         self.assertTrue(all(params is not None for sql, params in connection.statements
                             if sql.startswith("UPDATE")))
 
@@ -185,7 +218,8 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(report.status, "partial_failure")
         self.assertEqual([c.product_code for c in report.saved_changes], ["1", "3"])
         self.assertEqual(connection.prices, {1: 200, 2: 100, 3: 200})
-        self.assertEqual(report.failed_products, [{"product_code": "2", "error": "sqlstate_23514"}])
+        self.assertEqual(report.failed_products,
+                         [{"product_code": "2", "error": "sqlstate_23514", "category": "database"}])
 
     def test_known_commit_rejection_is_failure_and_can_continue(self):
         connection = FakeConnection({1: 100, 2: 100})
@@ -299,6 +333,130 @@ class ApplyTests(unittest.TestCase):
         self.assertTrue(connection.closed)
 
 
+class PreflightAndOutboxTests(unittest.TestCase):
+    run_case = ApplyTests.run_case
+
+    def outbox_rows(self, connection):
+        return [outbox.record_from_row(row) for row in connection.outbox]
+
+    def test_preflight_runs_after_lock_and_before_read_and_scan(self):
+        connection = FakeConnection({1: 100})
+        report = self.run_case(connection, {"1": 200})
+        self.assertEqual(connection.readiness_calls, 1)
+        self.assertEqual(report.status, "completed")
+
+    def test_preflight_problems_or_failure_stop_before_read_scan_and_writes(self):
+        for readiness in ([ReadinessIssue("column_missing", "products.has_been_recommended")],
+                          [ReadinessIssue("table_missing", "public.price_change_outbox")],
+                          ReadinessError("readiness_check_failed")):
+            with self.subTest(readiness=readiness):
+                connection = FakeConnection({1: 100})
+                connection.readiness = readiness
+                session, _ = make_session(connection)
+                collect = Mock(side_effect=AssertionError("must not scan"))
+                emitted = []
+                with self.assertLogs("price_refresh.apply", level="ERROR") as logs:
+                    report = run_apply(session, collect, emit=emitted.append)
+                self.assertEqual(report.status, "preflight_failed")
+                collect.assert_not_called()
+                self.assertFalse(any(sql.startswith(("SELECT product_code", "SELECT price", "UPDATE"))
+                                     for sql, _ in connection.statements))
+                self.assertTrue(connection.closed)
+                self.assertFalse(connection.locked)
+                self.assertEqual(emitted[0]["status"], "preflight_failed")
+                self.assertNotIn("postgresql://", str(logs.output))
+        self.assertEqual(report.error, "readiness_check_failed")
+
+    def test_preflight_issues_are_reported_with_codes(self):
+        connection = FakeConnection({1: 100})
+        connection.readiness = [ReadinessIssue("privilege_missing", "INSERT price_change_outbox")]
+        session, _ = make_session(connection)
+        report = run_apply(session, Mock())
+        self.assertEqual(report.error, "database_not_ready")
+        self.assertEqual(report.readiness_issues,
+                         [{"code": "privilege_missing", "target": "INSERT price_change_outbox"}])
+
+    def test_recommended_change_commits_price_and_outbox_from_fresh_row_values(self):
+        connection = FakeConnection({1: 100, 2: 100, 3: 100})
+        connection.flags = {1: True, 2: False, 3: True}
+        report = self.run_case(connection, {"1": 200, "2": 200, "3": 100},
+                               after_read=lambda: connection.prices.update({1: 150}))
+        self.assertEqual(connection.prices, {1: 200, 2: 200, 3: 100})
+        records = self.outbox_rows(connection)
+        self.assertEqual([(r.product_code, r.original_old_price, r.old_price, r.new_price, r.status)
+                          for r in records], [("1", 150, 150, 200, "PENDING")])
+        self.assertEqual(records[0].scan_run_id, uuid.UUID(report.run_id))
+        self.assertEqual(report.outbox_records, [{"product_code": "1", "outbox_id": records[0].id}])
+        payload = report.to_dict()
+        self.assertEqual((payload["updated_count"], payload["outbox_record_count"]), (2, 1))
+        self.assertEqual(connection.updates, [1, 2])
+        self.assertEqual(connection.commits, 2)
+
+    def test_same_price_never_writes_even_when_recommended(self):
+        connection = FakeConnection({1: 100})
+        connection.flags = {1: True}
+        report = self.run_case(connection, {"1": 200}, after_read=lambda: connection.prices.update({1: 200}))
+        self.assertEqual((connection.updates, connection.outbox), ([], []))
+        self.assertEqual(report.skipped_same_count, 1)
+
+    def test_one_run_id_for_all_records(self):
+        connection = FakeConnection({1: 100, 2: 100})
+        connection.flags = {1: True, 2: True}
+        report = self.run_case(connection, {"1": 200, "2": 300})
+        self.assertEqual({r.scan_run_id for r in self.outbox_rows(connection)}, {uuid.UUID(report.run_id)})
+
+    def test_outbox_failure_rolls_back_price_and_next_product_continues(self):
+        for error, code in ((SqlError("42501"), "sqlstate_42501"),
+                            (outbox.OutboxError("outbox_record_conflict"), "outbox_record_conflict")):
+            with self.subTest(code=code):
+                connection = FakeConnection({1: 100, 2: 100})
+                connection.flags = {1: True, 2: True}
+                connection.outbox_errors[1] = error
+                report = self.run_case(connection, {"1": 200, "2": 200})
+                self.assertEqual(report.status, "partial_failure")
+                self.assertEqual(connection.prices, {1: 100, 2: 200})
+                self.assertEqual([r.product_code for r in self.outbox_rows(connection)], ["2"])
+                self.assertEqual(report.failed_products,
+                                 [{"product_code": "1", "error": code, "category": "outbox"}])
+                self.assertEqual([c.product_code for c in report.saved_changes], ["2"])
+
+    def test_null_or_wrong_type_flag_fails_product_without_assuming_false(self):
+        for flag in (None, 1, "true"):
+            with self.subTest(flag=flag):
+                connection = FakeConnection({1: 100, 2: 100})
+                connection.flags = {1: flag, 2: True}
+                report = self.run_case(connection, {"1": 200, "2": 200})
+                self.assertEqual(connection.prices, {1: 100, 2: 200})
+                self.assertEqual(report.failed_products, [{"product_code": "1", "error": "invalid_recommendation_flag",
+                                                           "category": "database"}])
+                self.assertEqual(len(connection.outbox), 1)
+                self.assertFalse(any(sql.startswith("UPDATE products SET has_been_recommended")
+                                     for sql, _ in connection.statements))
+
+    def test_connection_loss_during_outbox_insert_stops_later_writes(self):
+        connection = FakeConnection({1: 100, 2: 100})
+        connection.flags = {1: True, 2: True}
+        connection.outbox_errors[1] = SqlError("08006")
+        report = self.run_case(connection, {"1": 200, "2": 200})
+        self.assertEqual(report.status, "aborted")
+        self.assertEqual(report.error, "lock_session_lost")
+        self.assertEqual(report.failed_products, [{"product_code": "1", "error": "lock_session_lost",
+                                                   "category": "connection"}])
+        self.assertEqual(connection.updates, [1])
+        self.assertEqual((connection.prices, connection.outbox), ({1: 100, 2: 100}, []))
+
+    def test_commit_unknown_with_outbox_counts_neither_price_nor_record(self):
+        connection = FakeConnection({1: 100, 2: 100, 3: 100})
+        connection.flags = {1: True, 2: True, 3: True}
+        connection.commit_errors = [None, SqlError("08006")]
+        report = self.run_case(connection, {"1": 200, "2": 200, "3": 200})
+        self.assertEqual(report.status, "aborted")
+        self.assertEqual([c.product_code for c in report.saved_changes], ["1"])
+        self.assertEqual([r["product_code"] for r in report.outbox_records], ["1"])
+        self.assertEqual(report.unknown_products, [{"product_code": "2", "error": "commit_outcome_unknown"}])
+        self.assertEqual(connection.updates, [1, 2])
+
+
 class ApplyCliTests(unittest.TestCase):
     def test_apply_rejects_fixture_and_conflicting_modes_before_any_database_or_scan(self):
         for arguments in (["--apply", "--fixture", "absent.json"],
@@ -323,21 +481,40 @@ class ApplyCliTests(unittest.TestCase):
                 json.loads(output.getvalue())
                 session.assert_not_called()
 
-    def test_apply_cli_uses_locked_writer_and_keeps_json_separate(self):
+    def test_apply_cli_uses_locked_writer_without_backend_settings_or_http(self):
         connection = FakeConnection({1: 100})
+        connection.flags = {1: True}
         session, _ = make_session(connection)
-        with patch("price_refresh.main.PostgresApplySession", return_value=session), \
+        with patch.dict("os.environ", {}, clear=True), \
+                patch("price_refresh.main.PostgresApplySession", return_value=session), \
                 patch("price_refresh.main.DatabaseSettings.from_env"), \
-                patch("price_refresh.main.BackendSettings.from_env"), \
                 patch("price_refresh.main.collect_prices", return_value=ScanResult(prices={"1": 200})), \
+                patch("price_refresh.backend.BackendSettings.from_env", side_effect=AssertionError("no backend")), \
+                patch("price_refresh.backend.BackendClient.send", side_effect=AssertionError("no backend HTTP")), \
+                patch("price_refresh.delivery.BackendDelivery.deliver", side_effect=AssertionError("no delivery")), \
+                patch("http.client.HTTPConnection.connect", side_effect=AssertionError("no HTTP")), \
+                patch("http.client.HTTPSConnection.connect", side_effect=AssertionError("no HTTPS")), \
                 redirect_stdout(io.StringIO()) as output:
             self.assertEqual(main(["--apply", "--category-limit", "1"]), 0)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["mode"], "apply")
-        self.assertEqual(payload["updated_count"], 1)
+        self.assertEqual((payload["updated_count"], payload["outbox_record_count"]), (1, 1))
         self.assertEqual(payload["saved_changes"],
                          [{"product_code": "1", "old_price": 100, "new_price": 200}])
+        self.assertNotIn("backend", payload)
         self.assertTrue(connection.closed)
+
+    def test_apply_cli_preflight_failure_exits_nonzero(self):
+        connection = FakeConnection({1: 100})
+        connection.readiness = [ReadinessIssue("table_missing", "public.price_change_outbox")]
+        session, _ = make_session(connection)
+        with patch("price_refresh.main.PostgresApplySession", return_value=session), \
+                patch("price_refresh.main.DatabaseSettings.from_env"), \
+                patch("price_refresh.main.collect_prices") as collect, \
+                redirect_stdout(io.StringIO()) as output, self.assertLogs("price_refresh.apply", "ERROR"):
+            self.assertEqual(main(["--apply"]), 1)
+        collect.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())["status"], "preflight_failed")
 
     def test_formatter_is_korean_time_even_when_container_uses_utc(self):
         record = logging.LogRecord("test", logging.INFO, "", 1, "hello", (), None)
