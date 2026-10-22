@@ -6,13 +6,15 @@ From price-refresh-crawler (no configuration files are edited):
   python3 tests/manual_timing.py --docker --db-env-file ../.env --live --scope all
 
 Run tests/test_manual_timing.py offline BEFORE --preflight/--live. --live updates
-only existing local prices through the real writer, never recommendation flags.
+only existing local prices through the real writer, never recommendation flags,
+and adds PENDING outbox records for changed recommended products.
 Successful first-category writes are NOT reset before the full run.
-Docker startup, imports and read-only preflight are excluded from the perf_counter
-run_apply measurement and included in the separate container_wall_seconds value.
-The first fake send ENTRY is the observation boundary; synthetic acknowledgements
-are not real backend successes. A failed live lookup aborts measurement immediately
-(after the scanner's existing finally/1-second wait), with no retry/next sort.
+Docker startup, imports and the tool's read-only preflight are excluded from the
+perf_counter run_apply measurement and included in container_wall_seconds.
+run_apply never sends to the backend; the boundary is the result emit after the
+last price/outbox commit. --live requires the price_change_outbox table, otherwise
+run_apply stops at its own preflight. A failed live lookup aborts measurement
+immediately (after the scanner's existing finally/1-second wait), with no retry/next sort.
 """
 
 import argparse
@@ -36,8 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from price_refresh.apply import run_apply
-from price_refresh.backend import BackendClient, BackendSettings, HttpResult, SUCCESS
-from price_refresh.delivery import BackendDelivery
+from price_refresh.backend import BackendClient
 from price_refresh.logging_config import configure_logging
 from price_refresh.parser import listing_items
 from price_refresh.repository import DatabaseSettings
@@ -111,29 +112,8 @@ def new_stats():
             "actual_backend_http_requests": 0}
 
 
-class RecordingBackend:
-    """Replace ONLY backend transport; real delivery still filters and builds batches."""
-
-    def __init__(self, marks, clock=time.perf_counter):
-        self.marks, self.clock = marks, clock
-        self.settings = BackendSettings("https://backend-disabled.invalid", {"X-Timing-Test": "not-auth"})
-        self.batch_sizes = []
-
-    def send(self, products):
-        instant = self.clock()  # FIRST operation: entry at the real delivery call site
-        self.marks.setdefault("first_backend_send", instant)
-        self.batch_sizes.append(len(products))
-        return HttpResult(200, {"code": SUCCESS, "message": "SIMULATED timing acknowledgement",
-            "data": {"received_count": len(products), "failed_product_codes": [], "not_found_product_codes": []}})
-
-
 def measure(session, collect, *, stats=None, clock=time.perf_counter):
     marks, stats = {}, stats if stats is not None else new_stats()
-    backend = RecordingBackend(marks, clock)
-    delivery = BackendDelivery(backend)
-    original_delivery = delivery.deliver
-    original_recommendations = session.fetch_recommendations
-    recommendation_seconds, recommendation_calls = 0.0, 0
     captured = {}
 
     def timed_collect():
@@ -147,74 +127,45 @@ def measure(session, collect, *, stats=None, clock=time.perf_counter):
         finally:
             marks["scan_end"] = clock()
 
-    def timed_recommendations(codes):
-        nonlocal recommendation_seconds, recommendation_calls
-        recommendation_calls += 1
-        started = clock()
-        try:
-            return original_recommendations(codes)
-        finally:
-            recommendation_seconds += clock() - started
-
-    def timed_delivery(*args):
-        marks["delivery_start"] = clock()
-        try:
-            return original_delivery(*args)
-        finally:
-            marks["delivery_end"] = clock()
+    def emit(payload):
+        marks["storage_end"] = clock()  # after the last price/outbox commit, still under the lock
+        captured.update(payload)
 
     aborted = False
-    with patch.object(delivery, "deliver", timed_delivery), \
-            patch.object(session, "fetch_recommendations", timed_recommendations):
-        started_at = datetime.now(timezone(timedelta(hours=9))).isoformat(timespec="milliseconds")
-        marks["start"] = clock()  # Immediately before the existing operating orchestrator.
-        try:
-            report = run_apply(session, timed_collect, delivery=delivery,
-                               emit=lambda payload: captured.update(payload))
-        except TimingAbort:
-            aborted = True  # run_apply's existing finally already closes/unlocks.
-        marks["end"] = clock()
+    started_at = datetime.now(timezone(timedelta(hours=9))).isoformat(timespec="milliseconds")
+    marks["start"] = clock()  # Immediately before the existing operating orchestrator.
+    try:
+        run_apply(session, timed_collect, emit=emit)
+    except TimingAbort:
+        aborted = True  # run_apply's existing finally already closes/unlocks.
+    marks["end"] = clock()
 
     def interval(start, end):
         return (round(marks[end] - marks[start], 6)
                 if start in marks and end in marks else None)
 
-    backend_report = captured.get("backend") or {}
-    if "first_backend_send" in marks:
-        boundary = "first_backend_send_entry"
-        boundary_time = marks["first_backend_send"]
-    elif backend_report.get("status") in {"skipped_no_targets", "skipped_no_saved_changes"}:
-        boundary = "delivery_returned_without_send"
-        boundary_time = marks.get("delivery_end")
-    else:
-        boundary, boundary_time = "not_reached", None
+    # emit also runs from run_apply's finally on aborts/preflight failures.
+    reached = not aborted and captured.get("status") in {"completed", "partial_failure"}
     return {
         "started_at_kst": started_at, "run_apply_status": captured.get("status"),
-        "measurement_aborted": aborted, "boundary": boundary,
-        "start_to_boundary_seconds": (round(boundary_time - marks["start"], 6)
-                                      if boundary_time is not None else None),
+        "measurement_aborted": aborted,
+        "boundary": "price_and_outbox_storage_complete" if reached else "not_reached",
+        "start_to_boundary_seconds": interval("start", "storage_end") if reached else None,
         "segments_seconds": {
-            "lock_and_initial_db_read": interval("start", "scan_start"),
+            "lock_preflight_and_initial_db_read": interval("start", "scan_start"),
             "actual_collection": interval("scan_start", "scan_end"),
-            "comparison_and_price_storage": interval("scan_end", "delivery_start"),
-            "recommendation_and_delivery_preparation": (
-                round(boundary_time - marks["delivery_start"], 6)
-                if boundary_time is not None and "delivery_start" in marks else None),
-            "recommendation_read_included_above": round(recommendation_seconds, 6),
+            "comparison_price_and_outbox_storage": interval("scan_end", "storage_end") if reached else None,
         },
         "program_run_apply_total_seconds": interval("start", "end"),
         "docker_startup_included_in_boundary": False,
         "target_count": captured.get("target_count"), "confirmed_count": captured.get("confirmed_count"),
         "unconfirmed_count": captured.get("unconfirmed_count"),
         "local_price_commit_count": captured.get("updated_count", 0),
+        "local_outbox_record_count": captured.get("outbox_record_count", 0),
         "local_price_failure_count": captured.get("failed_count", 0),
         "local_commit_unknown_count": captured.get("unknown_count", 0),
-        "recommended_delivery_target_count": backend_report.get("target_count"),
-        "recommendation_lookup": backend_report.get("recommendation_lookup"),
-        "recommendation_read_calls": recommendation_calls,
-        "delivery_status": backend_report.get("status"),
-        "simulated_backend_batch_sizes": backend.batch_sizes,
-        "backend_successes_are_simulated": True, "network": stats,
+        "readiness_issues": captured.get("readiness_issues", []),
+        "network": stats,
         "session_connection_closed": session.connection is None or session.connection.closed,
     }
 

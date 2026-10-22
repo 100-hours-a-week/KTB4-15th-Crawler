@@ -1,4 +1,4 @@
-"""Explicit backend configuration, one PATCH attempt, and strict response parsing."""
+"""Explicit backend configuration and exactly one PATCH attempt; parsing lives in price_sync."""
 
 import http.client
 import json
@@ -9,12 +9,10 @@ import socket
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from .comparison import normalize_code
 
 ENDPOINT = "/api/v1/internal/products"
 SUCCESS = "PRODUCT_PRICE_UPDATE_SUCCESS"
 PARTIAL = "PRODUCT_PRICE_UPDATE_PARTIAL_SUCCESS"
-FAILED = "PRODUCT_PRICE_UPDATE_FAILED"
 
 
 def unique_json_object(pairs):
@@ -150,55 +148,3 @@ class BackendClient:
         finally:
             if connection is not None:
                 connection.close()
-
-
-@dataclass
-class BatchOutcome:
-    successful: set = field(default_factory=set)
-    failed: set = field(default_factory=set)
-    not_found: set = field(default_factory=set)
-    unknown: set = field(default_factory=set)
-    error: object = None
-
-
-def classify_response(response, requested):
-    """Only HTTP 200 can establish success by complement of the two arrays."""
-    requested = set(requested)
-    payload = response.payload
-    if not isinstance(payload, dict) or not isinstance(payload.get("code"), str):
-        return BatchOutcome(unknown=requested, error="invalid_backend_response")
-    code = payload["code"]
-    # These errors are terminal for this attempt, but no per-product persistence
-    # contract was supplied. Do not label every product as a confirmed DB failure.
-    if response.status == 400 and code == "INVALID_REQUEST":
-        return BatchOutcome(unknown=requested, error="backend_invalid_request")
-    if response.status in {401, 403}:
-        return BatchOutcome(unknown=requested, error="backend_auth_rejected")
-    if response.status == 500 and code == "INTERNAL_SERVER_ERROR":
-        return BatchOutcome(unknown=requested, error="backend_internal_server_error")
-    if not ((response.status == 200 and code in {SUCCESS, PARTIAL})
-            or (response.status == 500 and code == FAILED)):
-        return BatchOutcome(unknown=requested, error="backend_unclassified_response")
-    data = payload.get("data")
-    if (not isinstance(payload.get("message"), str) or not isinstance(data, dict)
-            or type(data.get("received_count")) is not int
-            or data["received_count"] != len(requested)):
-        return BatchOutcome(unknown=requested, error="invalid_backend_response")
-    arrays = []
-    for name in ("failed_product_codes", "not_found_product_codes"):
-        values = data.get(name)
-        if (not isinstance(values, list)
-                or any(not isinstance(code, str) or normalize_code(code) != code
-                       or code not in requested for code in values)
-                or len(set(values)) != len(values)):
-            return BatchOutcome(unknown=requested, error="invalid_backend_response")
-        arrays.append(set(values))
-    failed, not_found = arrays
-    if failed & not_found or (response.status == 200 and (
-            (code == SUCCESS and bool(failed or not_found))
-            or (code == PARTIAL and not (failed or not_found)))):
-        return BatchOutcome(unknown=requested, error="invalid_backend_response")
-    remainder = requested - failed - not_found
-    return BatchOutcome(successful=remainder if response.status == 200 else set(),
-                        failed=failed, not_found=not_found,
-                        unknown=remainder if response.status != 200 else set())

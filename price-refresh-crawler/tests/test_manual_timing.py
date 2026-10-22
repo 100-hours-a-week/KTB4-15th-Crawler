@@ -73,25 +73,21 @@ class ManualTimingOfflineTests(unittest.TestCase):
         self.assertEqual(stats["actual_backend_http_requests"], 0)
         return result
 
-    def test_real_filter_batch_and_cleanup_with_only_transport_replaced(self):
+    def test_storage_boundary_with_recommended_outbox_and_no_backend(self):
         result = self.run_fixture(True)
-        self.assertEqual(result["boundary"], "first_backend_send_entry")
-        self.assertEqual(result["recommended_delivery_target_count"], 1)
-        self.assertEqual(result["simulated_backend_batch_sizes"], [1])
-        self.assertTrue(result["backend_successes_are_simulated"])
+        self.assertEqual(result["run_apply_status"], "completed")
+        self.assertEqual(result["boundary"], "price_and_outbox_storage_complete")
+        self.assertEqual(result["local_outbox_record_count"], 1)
         segments = result["segments_seconds"]
         elapsed = sum(segments[name] for name in (
-            "lock_and_initial_db_read", "actual_collection", "comparison_and_price_storage",
-            "recommendation_and_delivery_preparation"))
+            "lock_preflight_and_initial_db_read", "actual_collection", "comparison_price_and_outbox_storage"))
         self.assertAlmostEqual(elapsed, result["start_to_boundary_seconds"])
         self.assertGreater(result["program_run_apply_total_seconds"], elapsed)
 
-    def test_zero_targets_is_not_reported_as_first_transmission(self):
+    def test_not_recommended_changes_create_no_outbox_records(self):
         result = self.run_fixture(False)
-        self.assertEqual(result["boundary"], "delivery_returned_without_send")
-        self.assertEqual(result["recommendation_lookup"], "success")
-        self.assertEqual(result["recommended_delivery_target_count"], 0)
-        self.assertEqual(result["simulated_backend_batch_sizes"], [])
+        self.assertEqual(result["boundary"], "price_and_outbox_storage_complete")
+        self.assertEqual(result["local_outbox_record_count"], 0)
 
     def test_lookup_abort_releases_lock_and_does_not_invent_boundary(self):
         connection = FakeConnection({1: 100})

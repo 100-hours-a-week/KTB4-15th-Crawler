@@ -1,5 +1,3 @@
-"""Read, scan, compare, filter and preview; no writes or backend requests."""
-
 import logging
 from dataclasses import asdict
 
@@ -10,7 +8,6 @@ logger = logging.getLogger(__name__)
 
 
 def run_dry_run(repository, collect):
-    # Finish/close initial DB read before making any listing requests.
     stored = repository.fetch_prices()
     scan = collect()
     comparison = compare_prices(stored, scan.prices)

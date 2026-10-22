@@ -29,6 +29,8 @@ WORKDIR /app
 COPY price_refresh ./price_refresh
 COPY diagnostics ./diagnostics
 COPY tests ./tests
+# outbox 생성·정리 SQL을 읽는 테스트용. runtime 이미지에는 넣지 않으며 DB에 적용하지 않는다.
+COPY sql ./sql
 RUN python -m unittest discover -s tests -p 'test_*.py' \
  && touch /tmp/.tests-passed
 

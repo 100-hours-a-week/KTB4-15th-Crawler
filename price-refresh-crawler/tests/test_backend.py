@@ -9,9 +9,15 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import Mock, patch
 
-from price_refresh.backend import BackendClient, BackendError, BackendSettings, ENDPOINT
-from price_refresh.delivery import BackendDelivery
-from test_delivery import changes, fake_session, response
+from price_refresh.backend import BackendClient, BackendError, BackendSettings, ENDPOINT, SUCCESS
+from price_refresh.price_sync import COMPLETED, UNEXPECTED_STATUS, parse_sync_response, prepare_batch
+
+
+def response_payload(count, *, not_found=(), conflicts=()):
+    return {"code": SUCCESS if not (not_found or conflicts) else "PRODUCT_PRICE_UPDATE_PARTIAL_SUCCESS",
+            "message": "test response",
+            "data": {"received_count": count, "not_found_product_codes": list(not_found),
+                     "price_conflicts": [{"product_code": c, "current_price": p} for c, p in conflicts]}}
 
 
 class BackendSettingsTests(unittest.TestCase):
@@ -64,7 +70,7 @@ class FakeResponse:
     status = 200
 
     def __init__(self, body=None):
-        self.body = body or json.dumps(response(["1"]).payload).encode()
+        self.body = body or json.dumps(response_payload(1)).encode()
 
     def __enter__(self):
         return self
@@ -148,8 +154,7 @@ def local_backend(*, redirect=False):
         def do_PATCH(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append((self.path, body, self.headers.get("X-Test-Only")))
-            codes = [product["product_code"] for product in body["products"]]
-            payload = response(codes, failed=["2"] if len(requests) == 1 and "2" in codes else []).payload
+            payload = response_payload(len(body["products"]), conflicts=[("2", 150)])
             raw = json.dumps(payload).encode()
             self.send_response(302 if redirect else 200)
             self.send_header("Content-Type", "application/json")
@@ -174,27 +179,29 @@ def local_backend(*, redirect=False):
 
 
 class LocalHttpTests(unittest.TestCase):
-    def test_real_loopback_patch_partial_retry_and_exact_request_counts(self):
+    def batch(self):
+        return prepare_batch([{"id": code, "product_code": str(code), "old_price": 100, "new_price": 200}
+                              for code in (1, 2, 3)])
+
+    def test_real_loopback_patch_new_contract_single_request(self):
+        prepared = self.batch()
         with local_backend() as (port, requests):
             client = BackendClient(BackendSettings(f"http://127.0.0.1:{port}", {"X-Test-Only": "test-value"}))
-            report = BackendDelivery(client).deliver(fake_session(["1", "2", "3"]), changes(3))
-        self.assertEqual(len(requests), 2)
-        self.assertEqual([len(body["products"]) for _, body, _ in requests], [3, 1])
-        for path, body, auth in requests:
-            self.assertEqual(path, ENDPOINT)
-            self.assertEqual(body["changed_count"], len(body["products"]))
-            self.assertTrue(all(type(p["product_code"]) is str for p in body["products"]))
-            self.assertEqual(auth, "test-value")
-        self.assertEqual(requests[1][1]["products"], [requests[0][1]["products"][1]])
-        self.assertEqual(report.to_dict()["successful_count"], 3)
+            result = parse_sync_response(client.send(prepared.products()), prepared)
+        self.assertEqual(len(requests), 1)
+        path, body, auth = requests[0]
+        self.assertEqual((path, auth), (ENDPOINT, "test-value"))
+        self.assertEqual(body, prepared.body())
+        self.assertEqual((result.kind, result.succeeded, [c.product_code for c in result.conflicts]),
+                         (COMPLETED, ("1", "3"), ["2"]))
 
     def test_real_loopback_redirect_is_not_followed_or_retried(self):
+        prepared = self.batch()
         with local_backend(redirect=True) as (port, requests):
             client = BackendClient(BackendSettings(f"http://127.0.0.1:{port}", {"X-Test-Only": "test-value"}))
-            report = BackendDelivery(client).deliver(fake_session(["1"]), changes(1))
+            result = parse_sync_response(client.send(prepared.products()), prepared)
         self.assertEqual(len(requests), 1)
-        self.assertEqual(report.to_dict()["unknown_count"], 1)
-
+        self.assertEqual((result.kind, result.http_status, result.succeeded), (UNEXPECTED_STATUS, 302, ()))
 
 if __name__ == "__main__":
     unittest.main()
