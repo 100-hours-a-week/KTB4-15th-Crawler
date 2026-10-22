@@ -491,7 +491,7 @@ class ApplyCliTests(unittest.TestCase):
                 patch("price_refresh.main.collect_prices", return_value=ScanResult(prices={"1": 200})), \
                 patch("price_refresh.backend.BackendSettings.from_env", side_effect=AssertionError("no backend")), \
                 patch("price_refresh.backend.BackendClient.send", side_effect=AssertionError("no backend HTTP")), \
-                patch("price_refresh.delivery.BackendDelivery.deliver", side_effect=AssertionError("no delivery")), \
+                patch("price_refresh.main.run_delivery", side_effect=AssertionError("no delivery")), \
                 patch("http.client.HTTPConnection.connect", side_effect=AssertionError("no HTTP")), \
                 patch("http.client.HTTPSConnection.connect", side_effect=AssertionError("no HTTPS")), \
                 redirect_stdout(io.StringIO()) as output:
@@ -515,6 +515,33 @@ class ApplyCliTests(unittest.TestCase):
             self.assertEqual(main(["--apply"]), 1)
         collect.assert_not_called()
         self.assertEqual(json.loads(output.getvalue())["status"], "preflight_failed")
+
+    def test_missing_or_bad_backend_config_does_not_block_apply(self):
+        environments = [{}, {"PRICE_REFRESH_BACKEND_BASE_URL": "https://backend.invalid"},
+            {"PRICE_REFRESH_BACKEND_BASE_URL": "https://backend.invalid",
+             "PRICE_REFRESH_BACKEND_AUTH_HEADERS_JSON": "{}"},
+            {"PRICE_REFRESH_BACKEND_BASE_URL": "https://backend.invalid",
+             "PRICE_REFRESH_BACKEND_AUTH_HEADERS_JSON": '{"X-Test":"test"}',
+             "PRICE_REFRESH_BACKEND_BATCH_SIZE": "101"}]
+        for env in environments:
+            connection = FakeConnection({1: 100})
+            session, _ = make_session(connection)
+            with self.subTest(keys=sorted(env)), patch.dict("os.environ", env, clear=True), \
+                    patch("price_refresh.main.PostgresApplySession", return_value=session), \
+                    patch("price_refresh.main.DatabaseSettings.from_env"), \
+                    patch("price_refresh.main.collect_prices", return_value=ScanResult(prices={"1": 200})), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["--apply"]), 0)
+                self.assertEqual(connection.prices[1], 200)
+
+    def test_dry_run_ignores_backend_settings_and_never_calls_client(self):
+        with patch("price_refresh.backend.BackendSettings.from_env", side_effect=AssertionError("no preflight")), \
+                patch("price_refresh.backend.BackendClient.send", side_effect=AssertionError("no HTTP")), \
+                redirect_stdout(io.StringIO()) as stdout:
+            result = main(["--dry-run", "--fixture", "tests/fixtures/listing_response.json",
+                           "--stored-products-fixture", "tests/fixtures/stored_products.json", "--category-limit", "1"])
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["mode"], "dry_run")
 
     def test_formatter_is_korean_time_even_when_container_uses_utc(self):
         record = logging.LogRecord("test", logging.INFO, "", 1, "hello", (), None)

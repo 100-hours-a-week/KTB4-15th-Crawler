@@ -1,4 +1,4 @@
-"""CLI for collected prices, read-only previews, apply + outbox recording, and delivery control."""
+"""CLI for collected prices, previews, apply + outbox recording, outbox delivery and its control."""
 
 import argparse
 import json
@@ -13,6 +13,8 @@ from .source.client import TwentyNineCmClient
 from .source.fixture_client import FixtureClient
 from .dry_run import run_dry_run
 from .apply import run_apply
+from .backend import BackendClient, BackendError, BackendSettings
+from .delivery import EXIT_CODES, DeliverySettings, run_delivery
 from .delivery_control import DeliveryControlError, fetch_delivery_status, run_resume
 from .writer import DeliverySession, PostgresApplySession
 from .logging_config import configure_logging
@@ -40,6 +42,9 @@ def main(argv=None) -> int:
     modes.add_argument("--apply", action="store_true",
                        help="Apply prices and queue recommended changes in the outbox under a DB "
                             "session lock; never sends to the backend")
+    modes.add_argument("--deliver", action="store_true",
+                       help="One bounded outbox delivery run to the backend, then exit; "
+                            "exit 0 done, 3 authentication stop, 1 failure")
     modes.add_argument("--delivery-status", action="store_true",
                        help="Read-only: is outbox delivery stopped by an authentication failure? "
                             "Exit 0 allowed, 3 stopped, 1 check failed")
@@ -55,10 +60,12 @@ def main(argv=None) -> int:
         parser.error("--apply cannot use listing or stored-products fixtures")
     if args.stored_products_fixture and not (args.dry_run and args.fixture):
         parser.error("--stored-products-fixture requires --dry-run and --fixture")
-    control = args.delivery_status or args.resume_delivery
+    control = args.deliver or args.delivery_status or args.resume_delivery
     if control and (args.fixture or args.category_limit is not None):
-        parser.error("--delivery-status/--resume-delivery take no listing options")
+        parser.error("--deliver/--delivery-status/--resume-delivery take no listing options")
     configure_logging()
+    if args.deliver:
+        return deliver(args)
     if control:
         return delivery_control(args)
     try:
@@ -92,6 +99,30 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as error:
         logging.error("execution_failed error=%s", error)
         return 1
+
+
+def deliver(args):
+    """All configuration is validated before the database is opened; 29CM settings are not read."""
+    try:
+        database = DatabaseSettings.from_env()
+        client = BackendClient(BackendSettings.from_env())
+        settings = DeliverySettings.from_env()
+    except RepositoryError as error:
+        logging.error("database_configuration_failed code=%s", error.code)
+        return 1
+    except BackendError as error:
+        logging.error("backend_configuration_failed code=%s", error.code)
+        return 1
+    except ValueError as error:
+        logging.error("delivery_configuration_failed code=%s", error)
+        return 1
+    try:
+        report = run_delivery(DeliverySession(database), client, settings,
+                              emit=lambda payload: write_json(payload, args.output))
+    except OSError as error:
+        logging.error("execution_failed error=%s", type(error).__name__)
+        return 1
+    return EXIT_CODES.get(report.status, 1)
 
 
 def delivery_control(args):
