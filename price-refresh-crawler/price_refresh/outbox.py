@@ -270,3 +270,49 @@ def mark_blocked(connection, record_id, *, now, error_code, error_message=None, 
         "last_error_code = %s, last_error_message = %s, last_http_status = %s, updated_at = %s "
         "WHERE id = %s AND status IN (%s, %s)",
         (BLOCKED, code, message, status, _time(now), _record_id(record_id), PENDING, RETRY_WAIT)))
+
+
+_AUTH_STOP = f"status = '{RETRY_WAIT}' AND last_error_code = '{AUTH_FAILED}'"
+
+
+@dataclass(frozen=True)
+class DeliveryStop:
+    auth_failed_count: int
+    http_statuses: tuple
+
+    @property
+    def stopped(self):
+        return self.auth_failed_count > 0
+
+
+def delivery_stop_status(connection):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*), coalesce(array_agg(DISTINCT last_http_status ORDER BY last_http_status) "
+            "FILTER (WHERE last_http_status IS NOT NULL), '{}') "
+            f"FROM public.price_change_outbox WHERE {_AUTH_STOP}")
+        row = cursor.fetchone()
+    if (row is None or type(row[0]) is not int or row[0] < 0 or not isinstance(row[1], list)
+            or any(type(status) is not int for status in row[1])):
+        raise OutboxError("invalid_delivery_stop_status")
+    return DeliveryStop(row[0], tuple(row[1]))
+
+
+def mark_auth_failed(connection, record_ids, *, now, next_attempt_at, http_status):
+    if type(http_status) is not int or http_status not in (401, 403):
+        raise OutboxError("invalid_outbox_error")
+    ids = [_record_id(value) for value in record_ids]
+    if not ids or len(ids) > MAX_BATCH or len(set(ids)) != len(ids):
+        raise OutboxError("invalid_outbox_id")
+    records = [mark_retry(connection, record_id, now=now, next_attempt_at=next_attempt_at,
+                          error_code=AUTH_FAILED, http_status=http_status) for record_id in ids]
+    if any(record is None for record in records):
+        raise OutboxError("auth_failure_not_recorded")
+    return records
+
+
+def release_auth_stop(connection, *, now):
+    return sorted(_update(connection,
+        "UPDATE public.price_change_outbox SET last_error_code = NULL, last_error_message = NULL, "
+        f"next_attempt_at = %s, updated_at = %s WHERE {_AUTH_STOP}",
+        (_time(now), now)), key=lambda record: record.id)

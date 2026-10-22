@@ -11,8 +11,9 @@ from .repository import RepositoryError, recommendation_rows
 
 logger = logging.getLogger(__name__)
 # One fixed bigint key for ALL collection (--apply) runs (ASCII PRICEREF).
-# The outbox delivery job must use a different key so it never skips a collection.
 COLLECT_LOCK_KEY = 0x5052494345524546
+# Outbox delivery and its manual resume (ASCII PRICEDLV); never blocks or is blocked by collection.
+DELIVERY_LOCK_KEY = 0x5052494345444C56
 
 
 class ApplyError(RuntimeError):
@@ -53,11 +54,12 @@ def connection_failure(connection, error):
             or state in {"57P01", "57P02", "57P03", "40003"})
 
 
-class PostgresApplySession:
-    def __init__(self, settings, *, connect=None, readiness=check_readiness):
+class LockedSession:
+    lock_key = None
+
+    def __init__(self, settings, *, connect=None):
         self.settings = settings
         self._connect = connect
-        self._readiness = readiness
         self.connection = None
         self.acquired = False
         self.backend_pid = None
@@ -73,7 +75,7 @@ class PostgresApplySession:
                                       autocommit=True)
             self.connection.read_only = False
             with self.connection.cursor() as cursor:
-                cursor.execute("SELECT pg_try_advisory_lock(%s), pg_backend_pid()", (COLLECT_LOCK_KEY,))
+                cursor.execute("SELECT pg_try_advisory_lock(%s), pg_backend_pid()", (self.lock_key,))
                 self.acquired, self.backend_pid = cursor.fetchone()
             return self.acquired
         except Exception:
@@ -91,7 +93,7 @@ class PostgresApplySession:
                     "SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
                     "AND pid = pg_backend_pid() AND classid::bigint = %s "
                     "AND objid::bigint = %s AND objsubid = 1 AND granted)",
-                    (self.backend_pid, COLLECT_LOCK_KEY >> 32, COLLECT_LOCK_KEY & 0xffffffff),
+                    (self.backend_pid, self.lock_key >> 32, self.lock_key & 0xffffffff),
                 )
                 if cursor.fetchone()[0] is not True:
                     raise SessionLost("lock_session_lost")
@@ -99,6 +101,30 @@ class PostgresApplySession:
             raise
         except Exception:
             raise SessionLost("lock_session_lost") from None
+
+    def close(self):
+        if self.connection is None:
+            return
+        try:
+            if self.acquired and not self.connection.closed and not self.connection.broken:
+                with self.connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_advisory_unlock(%s)", (self.lock_key,))
+        except Exception:
+            logger.error("apply_cleanup_failed code=lock_release_failed")
+        finally:
+            try:
+                self.connection.close()
+            except Exception:
+                logger.error("apply_cleanup_failed code=session_close_failed")
+            self.acquired = False
+
+
+class PostgresApplySession(LockedSession):
+    lock_key = COLLECT_LOCK_KEY
+
+    def __init__(self, settings, *, connect=None, readiness=check_readiness):
+        super().__init__(settings, connect=connect)
+        self._readiness = readiness
 
     def check_readiness(self):
         """Catalog-only preflight on the autocommit lock session; ReadinessError propagates."""
@@ -218,18 +244,8 @@ class PostgresApplySession:
                                                or (step == "outbox" and phase != "commit")
                                                else "database"))
 
-    def close(self):
-        if self.connection is None:
-            return
-        try:
-            if self.acquired and not self.connection.closed and not self.connection.broken:
-                with self.connection.cursor() as cursor:
-                    cursor.execute("SELECT pg_advisory_unlock(%s)", (COLLECT_LOCK_KEY,))
-        except Exception:
-            logger.error("apply_cleanup_failed code=lock_release_failed")
-        finally:
-            try:
-                self.connection.close()
-            except Exception:
-                logger.error("apply_cleanup_failed code=session_close_failed")
-            self.acquired = False
+
+class DeliverySession(LockedSession):
+    """Lock for the outbox delivery job and manual resume; separate from collection."""
+
+    lock_key = DELIVERY_LOCK_KEY
