@@ -168,8 +168,6 @@ def classify_response(response, requested):
     if not isinstance(payload, dict) or not isinstance(payload.get("code"), str):
         return BatchOutcome(unknown=requested, error="invalid_backend_response")
     code = payload["code"]
-    # These errors are terminal for this attempt, but no per-product persistence
-    # contract was supplied. Do not label every product as a confirmed DB failure.
     if response.status == 400 and code == "INVALID_REQUEST":
         return BatchOutcome(unknown=requested, error="backend_invalid_request")
     if response.status in {401, 403}:
