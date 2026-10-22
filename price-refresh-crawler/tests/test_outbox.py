@@ -129,5 +129,57 @@ class InsertPendingTests(unittest.TestCase):
         self.assertEqual(insert_pending(connection, RUN, "123", 0, 79000).old_price, 0)
 
 
+class StateFunctionTests(unittest.TestCase):
+    LATER = NOW.replace(hour=3)
+
+    def test_invalid_arguments_never_reach_sql(self):
+        connection = FakeConnection([])
+        cases = [
+            lambda: outbox.select_due(connection, now=NOW, limit=0),
+            lambda: outbox.select_due(connection, now=NOW.replace(tzinfo=None)),
+            lambda: outbox.mark_attempts(connection, [1], now=NOW, next_attempt_at=NOW),
+            lambda: outbox.mark_attempts(connection, [], now=NOW, next_attempt_at=self.LATER),
+            lambda: outbox.mark_done(connection, 0, now=NOW),
+            lambda: outbox.mark_retry(connection, 1, now=NOW, next_attempt_at=self.LATER, error_code="x y"),
+            lambda: outbox.mark_price_conflict(connection, 1, now=NOW, next_attempt_at=self.LATER,
+                                               backend_price=-1),
+            lambda: outbox.mark_blocked(connection, 1, now=NOW, error_code=outbox.AUTH_FAILED),
+            lambda: outbox.mark_blocked(connection, 1, now=NOW, error_code="REJECTED", http_status=403),
+        ]
+        for index, call in enumerate(cases):
+            with self.subTest(case=index), self.assertRaises(OutboxError):
+                call()
+        self.assertEqual(connection.statements, [])
+
+    def test_values_are_parameters_and_results_require_an_attempt(self):
+        connection = RecordingConnection()
+        self.assertIsNone(outbox.mark_price_conflict(connection, 7, now=NOW, next_attempt_at=self.LATER,
+                                                     backend_price=65000))
+        sql, params = connection.statements[0]
+        self.assertNotIn("65000", sql)
+        self.assertIn("last_error_code = 'ATTEMPT_UNCONFIRMED'", sql)
+        self.assertIn("new_price <> %s", sql)
+        self.assertEqual(params[0], 65000)
+
+
+class RecordingConnection(FakeConnection):
+    """Every UPDATE matches no row."""
+
+    def __init__(self):
+        super().__init__([])
+
+    @contextmanager
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            def execute(self, sql, params=None):
+                connection.statements.append((sql, params))
+
+            def fetchall(self):
+                return []
+
+        yield Cursor()
+
 if __name__ == "__main__":
     unittest.main()
