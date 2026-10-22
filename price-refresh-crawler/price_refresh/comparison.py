@@ -1,5 +1,3 @@
-"""Pure price comparison at the DB/scanner boundary; no I/O."""
-
 from dataclasses import dataclass
 
 from .parser import display_price, product_code
@@ -14,7 +12,6 @@ def valid_price(value):
 
 
 def code_order(code):
-    # Exact numeric order, without float conversion or arbitrary-length int casts.
     return len(code), code
 
 

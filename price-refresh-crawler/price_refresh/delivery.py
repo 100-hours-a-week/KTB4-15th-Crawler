@@ -1,5 +1,3 @@
-"""Sequential first delivery + ONE retry of explicitly retryable product codes."""
-
 import logging
 from dataclasses import asdict, dataclass, field
 
@@ -84,14 +82,12 @@ class BackendDelivery:
             retryable = set()
 
             def send_batch(batch, *, retry):
-                # Every transaction has ended, but the session lock must still exist.
                 session.assert_delivery_ready()
                 if retry:
                     report.retry_request_count += 1
                     report.retry_product_count += len(batch)
                 else:
                     report.initial_request_count += 1
-                # Once a call starts, its outcome is unknown until validated.
                 for code in batch:
                     states[code] = "unknown"
                 status, phase, error_code = None, None, None
