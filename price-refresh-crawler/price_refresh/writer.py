@@ -1,15 +1,18 @@
-"""One PostgreSQL session owns the run lock and every price transaction."""
+"""One PostgreSQL session owns the collection lock and every price+outbox transaction."""
 
 import logging
 import re
 from dataclasses import dataclass
 
 from .comparison import PriceChange, code_order, normalize_code, valid_price
+from .outbox import OutboxError, insert_pending
+from .readiness import check_readiness
 from .repository import RepositoryError, recommendation_rows
 
 logger = logging.getLogger(__name__)
-# One fixed bigint key for ALL apply runs (ASCII PRICEREF).
-LOCK_KEY = 0x5052494345524546
+# One fixed bigint key for ALL collection (--apply) runs (ASCII PRICEREF).
+# The outbox delivery job must use a different key so it never skips a collection.
+COLLECT_LOCK_KEY = 0x5052494345524546
 
 
 class ApplyError(RuntimeError):
@@ -33,6 +36,9 @@ class WriteResult:
     status: str
     change: object = None
     error: str = None
+    # "database" or "outbox": which step of the product transaction failed.
+    error_category: str = None
+    outbox_id: int = None
 
 
 def sqlstate(error):
@@ -48,9 +54,10 @@ def connection_failure(connection, error):
 
 
 class PostgresApplySession:
-    def __init__(self, settings, *, connect=None):
+    def __init__(self, settings, *, connect=None, readiness=check_readiness):
         self.settings = settings
         self._connect = connect
+        self._readiness = readiness
         self.connection = None
         self.acquired = False
         self.backend_pid = None
@@ -66,7 +73,7 @@ class PostgresApplySession:
                                       autocommit=True)
             self.connection.read_only = False
             with self.connection.cursor() as cursor:
-                cursor.execute("SELECT pg_try_advisory_lock(%s), pg_backend_pid()", (LOCK_KEY,))
+                cursor.execute("SELECT pg_try_advisory_lock(%s), pg_backend_pid()", (COLLECT_LOCK_KEY,))
                 self.acquired, self.backend_pid = cursor.fetchone()
             return self.acquired
         except Exception:
@@ -84,7 +91,7 @@ class PostgresApplySession:
                     "SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
                     "AND pid = pg_backend_pid() AND classid::bigint = %s "
                     "AND objid::bigint = %s AND objsubid = 1 AND granted)",
-                    (self.backend_pid, LOCK_KEY >> 32, LOCK_KEY & 0xffffffff),
+                    (self.backend_pid, COLLECT_LOCK_KEY >> 32, COLLECT_LOCK_KEY & 0xffffffff),
                 )
                 if cursor.fetchone()[0] is not True:
                     raise SessionLost("lock_session_lost")
@@ -92,6 +99,11 @@ class PostgresApplySession:
             raise
         except Exception:
             raise SessionLost("lock_session_lost") from None
+
+    def check_readiness(self):
+        """Catalog-only preflight on the autocommit lock session; ReadinessError propagates."""
+        self.assert_lock()
+        return self._readiness(self.connection)
 
     def fetch_prices(self):
         self.assert_lock()
@@ -139,11 +151,16 @@ class PostgresApplySession:
                     else "recommendation_lookup_failed")
             raise RepositoryError(code) from None
 
-    def write_one(self, code, new_price):
+    def write_one(self, code, new_price, scan_run_id):
+        """Commit one price change, plus its PENDING outbox record when recommended.
+
+        The flag is read from the locked row in the same transaction, so a price
+        UPDATE can never commit without the outbox INSERT it requires.
+        """
         if (not isinstance(code, str) or normalize_code(code) != code or len(code) > 19
                 or int(code) > 9223372036854775807 or valid_price(new_price) is None):
-            return WriteResult("failed", error="invalid_price_candidate")
-        phase, wrote = "transaction", False
+            return WriteResult("failed", error="invalid_price_candidate", error_category="database")
+        phase, step, wrote = "transaction", "database", False
         try:
             self.assert_lock()
             # Explicit short transaction on the SAME autocommit session.
@@ -151,8 +168,8 @@ class PostgresApplySession:
             with self.connection.transaction():
                 self.assert_lock()
                 with self.connection.cursor() as cursor:
-                    cursor.execute("SELECT price FROM products WHERE product_code = %s FOR UPDATE",
-                                   (int(code),))
+                    cursor.execute("SELECT price, has_been_recommended FROM products "
+                                   "WHERE product_code = %s FOR UPDATE", (int(code),))
                     row = cursor.fetchone()
                     if row is None:
                         result = WriteResult("missing")
@@ -160,34 +177,46 @@ class PostgresApplySession:
                         raise ApplyError("invalid_current_database_price")
                     elif row[0] == new_price:
                         result = WriteResult("same")
+                    elif type(row[1]) is not bool:
+                        # NULL/unexpected is never treated as FALSE.
+                        raise ApplyError("invalid_recommendation_flag")
                     else:
-                        old_price = row[0]
+                        old_price, recommended = row
                         cursor.execute("UPDATE products SET price = %s WHERE product_code = %s",
                                        (new_price, int(code)))
                         if cursor.rowcount != 1:
                             raise ApplyError("unexpected_update_count")
                         wrote = True
-                        result = WriteResult("updated", PriceChange(code, old_price, new_price))
+                        record = None
+                        if recommended:
+                            step = "outbox"
+                            record = insert_pending(self.connection, scan_run_id, code, old_price, new_price)
+                        result = WriteResult("updated", PriceChange(code, old_price, new_price),
+                                             outbox_id=record.id if record else None)
                 self.assert_lock()
                 phase = "commit"
             # Only reachable after the context manager confirms COMMIT.
             return result
         except Exception as error:
             state = sqlstate(error)
+            known = isinstance(error, (ApplyError, OutboxError))
             unsafe = connection_failure(self.connection, error)
             if phase == "commit" and wrote and unsafe:
                 raise CommitUnknown("commit_outcome_unknown") from None
-            if isinstance(error, SessionLost) or (unsafe and not isinstance(error, ApplyError)):
+            if isinstance(error, SessionLost) or (unsafe and not known):
                 raise SessionLost("lock_session_lost") from None
-            # The transaction context rolls back statement/known COMMIT failures.
+            # The transaction context rolls back statement/known COMMIT failures,
+            # including the price UPDATE when the outbox INSERT failed.
             # Validate that rollback completed and the session still owns its lock.
             try:
                 self.connection.rollback()
                 self.assert_lock()
             except Exception:
                 raise SessionLost("rollback_or_lock_failed") from None
-            return WriteResult("failed", error=(error.code if isinstance(error, ApplyError)
-                                                else "sqlstate_" + state))
+            return WriteResult("failed", error=(error.code if known else "sqlstate_" + state),
+                               error_category=("outbox" if isinstance(error, OutboxError)
+                                               or (step == "outbox" and phase != "commit")
+                                               else "database"))
 
     def close(self):
         if self.connection is None:
@@ -195,7 +224,7 @@ class PostgresApplySession:
         try:
             if self.acquired and not self.connection.closed and not self.connection.broken:
                 with self.connection.cursor() as cursor:
-                    cursor.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+                    cursor.execute("SELECT pg_advisory_unlock(%s)", (COLLECT_LOCK_KEY,))
         except Exception:
             logger.error("apply_cleanup_failed code=lock_release_failed")
         finally:

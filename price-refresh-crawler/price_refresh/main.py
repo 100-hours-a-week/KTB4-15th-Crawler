@@ -1,4 +1,4 @@
-"""CLI for collected prices, read-only previews, and explicit apply + delivery."""
+"""CLI for collected prices, read-only previews, and explicit apply + outbox recording."""
 
 import argparse
 import json
@@ -15,8 +15,6 @@ from .dry_run import run_dry_run
 from .apply import run_apply
 from .writer import PostgresApplySession
 from .logging_config import configure_logging
-from .backend import BackendClient, BackendError, BackendSettings
-from .delivery import BackendDelivery
 from .repository import (
     DatabaseSettings, FixturePriceRepository, PostgresPriceRepository, RepositoryError,
 )
@@ -38,7 +36,9 @@ def main(argv=None) -> int:
     parser.add_argument("--output", type=Path, help="Write JSON to a new file instead of stdout")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--dry-run", action="store_true", help="Read stored prices, compare and preview only")
-    modes.add_argument("--apply", action="store_true", help="Explicitly apply prices under a DB session lock")
+    modes.add_argument("--apply", action="store_true",
+                       help="Apply prices and queue recommended changes in the outbox under a DB "
+                            "session lock; never sends to the backend")
     parser.add_argument("--stored-products-fixture", type=Path,
                         help="Offline DB substitute; requires --dry-run and --fixture")
     args = parser.parse_args(argv)
@@ -58,11 +58,9 @@ def main(argv=None) -> int:
         else:
             collect = lambda: collect_prices(TwentyNineCmClient(settings), categories, settings)
         if args.apply:
-            # Mandatory preflight: no DB connection/price write with missing or
-            # invalid backend URL/auth/batch/timeout configuration.
-            backend = BackendDelivery(BackendClient(BackendSettings.from_env()))
+            # Backend settings are not read: delivery is a separate outbox job.
             report = run_apply(PostgresApplySession(DatabaseSettings.from_env()), collect,
-                               emit=lambda payload: write_json(payload, args.output), delivery=backend)
+                               emit=lambda payload: write_json(payload, args.output))
             return 0 if report.status in {"completed", "skipped_concurrent"} else 1
         if args.dry_run:
             repository = (FixturePriceRepository(args.stored_products_fixture)
@@ -78,9 +76,6 @@ def main(argv=None) -> int:
         return 1 if failed else 0
     except RepositoryError as error:
         logging.error("database_configuration_or_read_failed code=%s", error.code)
-        return 1
-    except BackendError as error:
-        logging.error("backend_configuration_failed code=%s", error.code)
         return 1
     except (OSError, ValueError) as error:
         logging.error("execution_failed error=%s", error)

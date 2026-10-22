@@ -264,73 +264,21 @@ class DeliveryTests(unittest.TestCase):
 
 
 class ApplyDeliveryTests(unittest.TestCase):
-    def test_commit_unknown_never_enters_backend_phase(self):
-        connection = FakeConnection({1: 100, 2: 100, 3: 100})
-        connection.flags = {1: True, 2: True, 3: True}
-        connection.commit_errors = [None, SqlError("08006")]
-        session, _ = make_session(connection)
-        client = FakeBackend()
-        report = run_apply(session, lambda: ScanResult(prices={"1": 200, "2": 200, "3": 200}),
-                           delivery=BackendDelivery(client))
-        self.assertEqual(report.status, "aborted")
-        self.assertEqual([c.product_code for c in report.saved_changes], ["1"])
-        self.assertEqual(report.to_dict()["unknown_count"], 1)
-        self.assertEqual(report.backend["skip_reason"], "skipped_apply_aborted")
-        self.assertEqual(client.calls, [])
-        self.assertFalse(any("has_been_recommended" in sql for sql, _ in connection.statements))
-
-    def test_only_committed_items_transmitted_under_lock_after_transactions_end(self):
-        connection = FakeConnection({1: 100, 2: 100, 3: 100, 4: 100})
-        connection.flags = {1: True, 2: True, 3: True, 4: False}
-        connection.failure_codes[2] = "23514"
-        session, _ = make_session(connection)
-
-        def during_http(_):
-            self.assertTrue(connection.locked)
-            self.assertEqual(connection.info.transaction_status, 0)
-            self.assertEqual(connection.prices, {1: 200, 2: 100, 3: 100, 4: 200})
-
-        client = FakeBackend([response(["1"], failed=["1"])], on_send=during_http)
-        emitted = []
-
-        def emit(payload):
-            self.assertTrue(connection.locked)
-            self.assertEqual(len(client.calls), 2)
-            emitted.append(payload)
-
-        report = run_apply(session, lambda: ScanResult(prices={"1": 200, "2": 200, "3": 100, "4": 200}),
-                           delivery=BackendDelivery(client), emit=emit)
-        self.assertEqual([c.product_code for c in report.saved_changes], ["1", "4"])
-        self.assertEqual(client.calls, [[{"product_code": "1", "old_price": 100, "new_price": 200}]] * 2)
-        self.assertTrue(connection.closed)
-        self.assertEqual(emitted[0]["backend"]["successful_count"], 1)
-        queries = [(sql, params) for sql, params in connection.statements if "has_been_recommended" in sql]
-        self.assertEqual(queries[0][1], ([1, 4],))
-
-    def test_delivery_failure_does_not_rollback_committed_prices(self):
-        connection = FakeConnection({1: 100})
-        connection.flags[1] = True
-        session, _ = make_session(connection)
-        client = FakeBackend([BackendError("backend_timeout")])
-        report = run_apply(session, lambda: ScanResult(prices={"1": 200}), delivery=BackendDelivery(client))
-        self.assertEqual(report.status, "partial_failure")
-        self.assertEqual(connection.prices[1], 200)
-        self.assertEqual(connection.rollbacks, 0)
-        self.assertEqual(len(report.saved_changes), 1)
-        self.assertEqual(report.backend["unknown_count"], 1)
-
-    def test_lost_lock_after_initial_failure_prevents_retry_and_aborts_apply(self):
-        connection = FakeConnection({1: 100})
-        connection.flags[1] = True
-        session, _ = make_session(connection)
-        client = FakeBackend([response(["1"], failed=["1"])],
-                             on_send=lambda _: setattr(connection, "locked", False))
-        report = run_apply(session, lambda: ScanResult(prices={"1": 200}), delivery=BackendDelivery(client))
-        self.assertEqual(len(client.calls), 1)
-        self.assertEqual(report.status, "aborted")
-        self.assertEqual(report.backend["failed_count"], 1)
-        self.assertEqual(report.backend["retry_request_count"], 0)
-        self.assertEqual(connection.prices[1], 200)
+    def test_apply_never_enters_backend_delivery(self):
+        for commit_errors in ([], [None, SqlError("08006")]):
+            with self.subTest(commit_errors=commit_errors), \
+                    patch.object(BackendDelivery, "deliver", side_effect=AssertionError("no delivery")) as deliver, \
+                    patch("price_refresh.backend.BackendClient.send", side_effect=AssertionError("no HTTP")) as send:
+                connection = FakeConnection({1: 100, 2: 100, 3: 100})
+                connection.flags = {1: True, 2: True, 3: False}
+                connection.commit_errors = list(commit_errors)
+                session, _ = make_session(connection)
+                report = run_apply(session, lambda: ScanResult(prices={"1": 200, "2": 200, "3": 200}))
+                self.assertIn(report.status, {"completed", "aborted"})
+                self.assertGreater(len(connection.outbox), 0)
+                deliver.assert_not_called()
+                send.assert_not_called()
+                self.assertFalse(any("ANY(%s)" in sql for sql, _ in connection.statements))
 
     def test_recommendation_query_is_batched_and_parameterized_on_lock_session(self):
         connection = FakeConnection({1: 100, 2: 100, 3: 100})
@@ -362,7 +310,7 @@ class ApplyDeliveryTests(unittest.TestCase):
             finally:
                 session.close()
 
-    def test_missing_or_bad_backend_config_blocks_db_read_scan_and_write(self):
+    def test_missing_or_bad_backend_config_does_not_block_apply(self):
         environments = [{}, {"PRICE_REFRESH_BACKEND_BASE_URL": "https://backend.invalid"},
             {"PRICE_REFRESH_BACKEND_BASE_URL": "https://backend.invalid",
              "PRICE_REFRESH_BACKEND_AUTH_HEADERS_JSON": "{}"},
@@ -370,15 +318,18 @@ class ApplyDeliveryTests(unittest.TestCase):
              "PRICE_REFRESH_BACKEND_AUTH_HEADERS_JSON": '{"X-Test":"test"}',
              "PRICE_REFRESH_BACKEND_BATCH_SIZE": "101"}]
         for env in environments:
+            connection = FakeConnection({1: 100})
+            session, _ = make_session(connection)
             with self.subTest(keys=sorted(env)), patch.dict("os.environ", env, clear=True), \
-                    patch("price_refresh.main.PostgresApplySession") as session, \
-                    patch("price_refresh.main.collect_prices") as collect:
-                self.assertEqual(main(["--apply"]), 1)
-                session.assert_not_called()
-                collect.assert_not_called()
+                    patch("price_refresh.main.PostgresApplySession", return_value=session), \
+                    patch("price_refresh.main.DatabaseSettings.from_env"), \
+                    patch("price_refresh.main.collect_prices", return_value=ScanResult(prices={"1": 200})), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["--apply"]), 0)
+                self.assertEqual(connection.prices[1], 200)
 
     def test_dry_run_ignores_backend_settings_and_never_calls_client(self):
-        with patch("price_refresh.main.BackendSettings.from_env", side_effect=AssertionError("no preflight")), \
+        with patch("price_refresh.backend.BackendSettings.from_env", side_effect=AssertionError("no preflight")), \
                 patch("price_refresh.backend.BackendClient.send", side_effect=AssertionError("no HTTP")), \
                 redirect_stdout(io.StringIO()) as stdout:
             result = main(["--dry-run", "--fixture", "tests/fixtures/listing_response.json",
