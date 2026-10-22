@@ -15,11 +15,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from price_refresh import outbox
+from price_refresh.apply import run_apply
 from price_refresh.backend import BackendClient, BackendError, BackendSettings, HttpResult
 from price_refresh.delivery import DeliverySettings, run_delivery
 from price_refresh.delivery_control import fetch_delivery_status, run_resume
 from price_refresh.outbox import ATTEMPT_UNCONFIRMED, AUTH_FAILED
 from price_refresh.repository import DatabaseSettings
+from price_refresh.scanner import ScanResult
 from price_refresh.writer import DeliverySession, PostgresApplySession
 
 TEST_URL = os.getenv("PRICE_REFRESH_TEST_DATABASE_URL", "")
@@ -392,6 +394,74 @@ class PostgresDeliveryTests(unittest.TestCase):
         backend = FakeBackend({str(c): 999 for c in range(1, 6)}, batch_size=2)   # every product conflicts
         report = self.deliver(backend, settings=DeliverySettings(max_requests=50))
         self.assertEqual((len(backend.calls), report.conflict_retry_count, report.batch_limit_reached), (3, 5, False))
+
+    def test_nothing_due_after_run_start_is_selected_in_the_same_run(self):
+        for code in (1, 2, 3):
+            self.add(code)
+        ticks = iter(range(0, 10000, 10))
+        clock = lambda: T0 + timedelta(seconds=next(ticks))   # 10 s per call; retries due 1 s later
+
+        def insert_new(_body):
+            self.admin.execute(
+                "INSERT INTO price_change_outbox (scan_run_id, product_code, original_old_price, old_price, "
+                "new_price, next_attempt_at) VALUES (%s, 9, 100, 100, 200, %s)", (uuid.uuid4(), T0 + timedelta(seconds=1)))
+
+        backend = FakeBackend({str(c): 999 for c in (1, 2, 3, 9)}, batch_size=1, on_send=insert_new)
+        session = DeliverySession(self.database)
+        self.addCleanup(session.close)
+        report = run_delivery(session, backend, DeliverySettings(retry_delay_seconds=1, max_requests=100),
+                              clock=clock)
+        self.assertEqual([call["products"][0]["product_code"] for call in backend.calls], ["1", "2", "3"])
+        self.assertEqual((report.conflict_retry_count, report.batch_limit_reached), (3, False))
+
+    def test_batch_cap_bounds_runs_that_send_nothing(self):
+        for code in range(1, 8):
+            self.add(code, old=0)                    # every record invalid: no HTTP at all
+        backend = FakeBackend(batch_size=2)
+        report = self.deliver(backend, settings=DeliverySettings(max_requests=10, max_batches=2))
+        self.assertEqual((report.batch_count, report.invalid_blocked_count, report.http_request_count,
+                          report.batch_limit_reached, report.limit_reason), (2, 4, 0, True, "max_batches"))
+        self.assertEqual(sum(r.status == "PENDING" for r in self.rows().values()), 3)
+
+    def test_delivery_status_and_resume_need_only_outbox_select_update(self):
+        role = f"price_refresh_delivery_{uuid.uuid4().hex[:8]}"
+        self.admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD 'delivery-test-only'")
+        self.addCleanup(self.admin.execute, f"DROP ROLE {role}")
+        self.addCleanup(self.admin.execute, f"DROP OWNED BY {role}")
+        self.admin.execute(f"GRANT USAGE ON SCHEMA public TO {role}")
+        self.admin.execute(f"GRANT SELECT, UPDATE ON price_change_outbox TO {role}")
+        from psycopg.conninfo import conninfo_to_dict
+        config = conninfo_to_dict(TEST_URL)
+        limited = DatabaseSettings(f"postgresql://{role}:delivery-test-only@{config['host']}:"
+                                   f"{config.get('port', '5432')}/{config['dbname']}")
+        ids = [self.add(code) for code in (1, 2, 3)]
+        backend = FakeBackend({"1": 100, "2": 100, "3": 100}, batch_size=1,
+                              script=[None, HttpResult(403, None)])
+        session = DeliverySession(limited)
+        self.addCleanup(session.close)
+        report = run_delivery(session, backend, DeliverySettings(), clock=lambda: T0)
+        self.assertEqual((report.succeeded_count, report.status), (1, "auth_stopped"))
+        self.assertTrue(fetch_delivery_status(limited).stopped)
+        self.assertEqual(run_resume(DeliverySession(limited), now=T0 + timedelta(hours=1)).status, "resumed")
+        again = run_delivery(DeliverySession(limited), backend, DeliverySettings(), clock=lambda: T0 + timedelta(hours=1))
+        self.assertEqual((again.status, again.succeeded_count), ("completed", 2))
+        self.assertEqual([self.status(i) for i in ids], ["DONE"] * 3)
+
+    def test_collection_then_delivery_end_to_end(self):
+        self.admin.execute("UPDATE products SET has_been_recommended = TRUE WHERE product_code IN (1, 2)")
+        applied = run_apply(PostgresApplySession(self.database), lambda: ScanResult(prices={"1": 1100, "2": 1200, "3": 1300}))
+        self.assertEqual((applied.status, applied.to_dict()["updated_count"], applied.to_dict()["outbox_record_count"]),
+                         ("completed", 3, 2))
+        backend = FakeBackend({"1": 1000, "2": 1000}, script=[BackendError("backend_timeout", phase="response")])
+        now = datetime.now(timezone.utc) + timedelta(minutes=1)   # records were queued at the DB's current time
+        failed = self.deliver(backend, now=now)
+        self.assertEqual((failed.status, failed.error_retry_count), ("completed_with_errors", 2))
+        prices = dict(self.admin.execute("SELECT product_code, price FROM products WHERE product_code <= 3").fetchall())
+        self.assertEqual(prices, {1: 1100, 2: 1200, 3: 1300})          # delivery failure never reverts AI prices
+        later = self.deliver(backend, now=now + timedelta(seconds=300))
+        self.assertEqual((later.status, later.succeeded_count), ("completed", 2))
+        self.assertEqual(backend.prices, {"1": 1100, "2": 1200})
+        self.assertEqual([p["old_price"] for p in backend.calls[1]["products"]], [1000, 1000])
 
     def test_real_client_over_loopback_http(self):
         record = self.add(7)

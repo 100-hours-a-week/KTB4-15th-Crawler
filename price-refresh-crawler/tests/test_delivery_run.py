@@ -22,15 +22,15 @@ BACKEND_ENV = {"DATABASE_URL": "postgresql://unused/unused",
 class DeliverySettingsTests(unittest.TestCase):
     def test_defaults_and_backoff_cap(self):
         settings = DeliverySettings()
-        self.assertEqual((settings.retry_delay_seconds, settings.retry_max_delay_seconds, settings.max_requests),
-                         (300, 3600, 10))
+        self.assertEqual((settings.retry_delay_seconds, settings.retry_max_delay_seconds, settings.max_requests,
+                          settings.max_batches), (300, 3600, 10, 20))
         delays = [settings.retry_at(NOW, attempt) - NOW for attempt in (0, 1, 2, 3, 4, 5, 50)]
         self.assertEqual([d.total_seconds() for d in delays], [300, 300, 600, 1200, 2400, 3600, 3600])
 
     def test_invalid_values(self):
         for kwargs in ({"retry_delay_seconds": 0}, {"retry_delay_seconds": True}, {"max_requests": 0},
                        {"max_requests": 1001}, {"retry_delay_seconds": 600, "retry_max_delay_seconds": 300},
-                       {"retry_max_delay_seconds": 86401}):
+                       {"retry_max_delay_seconds": 86401}, {"max_batches": 0}, {"max_batches": 10001}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 DeliverySettings(**kwargs)
         for env in ({"PRICE_REFRESH_DELIVERY_MAX_REQUESTS": "x"}, {"PRICE_REFRESH_DELIVERY_RETRY_DELAY_SECONDS": "1.5"}):
