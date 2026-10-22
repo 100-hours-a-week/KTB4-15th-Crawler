@@ -28,14 +28,18 @@ class DeliveryError(RuntimeError):
 
 @dataclass(frozen=True)
 class DeliverySettings:
-    """Per-record retry backoff (base doubling up to max) and a per-run request cap."""
+    """Per-record retry backoff (base doubling up to max) and per-run request/batch caps.
+
+    max_batches also bounds batches that send nothing (all records invalid).
+    """
     retry_delay_seconds: int = 300
     retry_max_delay_seconds: int = 3600
     max_requests: int = 10
+    max_batches: int = 20
 
     def __post_init__(self):
         for value, upper in ((self.retry_delay_seconds, 86400), (self.retry_max_delay_seconds, 86400),
-                             (self.max_requests, 1000)):
+                             (self.max_requests, 1000), (self.max_batches, 10000)):
             if type(value) is not int or not 1 <= value <= upper:
                 raise ValueError("invalid_delivery_settings")
         if self.retry_max_delay_seconds < self.retry_delay_seconds:
@@ -46,7 +50,8 @@ class DeliverySettings:
         try:
             return cls(int(os.getenv("PRICE_REFRESH_DELIVERY_RETRY_DELAY_SECONDS", "300")),
                        int(os.getenv("PRICE_REFRESH_DELIVERY_RETRY_MAX_DELAY_SECONDS", "3600")),
-                       int(os.getenv("PRICE_REFRESH_DELIVERY_MAX_REQUESTS", "10")))
+                       int(os.getenv("PRICE_REFRESH_DELIVERY_MAX_REQUESTS", "10")),
+                       int(os.getenv("PRICE_REFRESH_DELIVERY_MAX_BATCHES", "20")))
         except (TypeError, ValueError):
             raise ValueError("invalid_delivery_settings") from None
 
@@ -58,6 +63,7 @@ class DeliverySettings:
 @dataclass
 class DeliveryRunReport:
     status: str = "aborted"
+    batch_count: int = 0
     selected_count: int = 0
     invalid_blocked_count: int = 0
     attempted_count: int = 0
@@ -72,6 +78,7 @@ class DeliveryRunReport:
     result_save_failed: bool = False
     outcome_unknown: bool = False
     batch_limit_reached: bool = False
+    limit_reason: str = None   # max_requests or max_batches; due records remain for the next run
     stop_reason: str = None
     error: str = None
 
@@ -91,6 +98,9 @@ class _Run:
         self.session, self.client, self.settings, self.clock = session, client, settings, clock
         self.connection = session.connection
         self.report = report
+        # Only records due at run start: anything rescheduled or inserted during this run
+        # waits for a later run, so the run cannot keep feeding itself.
+        self.cutoff = clock()
 
     def write(self, operation):
         """One short transaction; any unapplied change raises and rolls everything back."""
@@ -116,13 +126,16 @@ class _Run:
         """Process one due batch; returns False when the run must end."""
         now = self.clock()
         self.session.assert_lock()
-        records = select_due(self.connection, now=now, limit=self.client.settings.batch_size)
+        records = select_due(self.connection, now=self.cutoff, limit=self.client.settings.batch_size)
         if not records:
             return False
         report = self.report
-        if report.http_request_count >= self.settings.max_requests:
-            report.batch_limit_reached = True
-            return False
+        for limit in ("max_requests", "max_batches"):
+            used = report.http_request_count if limit == "max_requests" else report.batch_count
+            if used >= getattr(self.settings, limit):
+                report.batch_limit_reached, report.limit_reason = True, limit
+                return False
+        report.batch_count += 1
         report.selected_count += len(records)
         batch = prepare_batch(records)
         if batch.error == "batch_too_large":
@@ -277,12 +290,13 @@ def run_delivery(session, client, settings, *, clock=_utc_now, emit=None):
                 "delivery_end status=%s duration_seconds=%.3f selected=%s invalid_blocked=%s attempted=%s "
                 "http_requests=%s succeeded=%s conflict_retry=%s error_retry=%s not_found=%s "
                 "request_rejected_blocked=%s auth_stopped=%s auth_stop_saved=%s result_save_failed=%s "
-                "outcome_unknown=%s batch_limit_reached=%s stop_reason=%s error=%s",
+                "outcome_unknown=%s batch_limit_reached=%s limit_reason=%s batches=%s stop_reason=%s error=%s",
                 report.status, time.monotonic() - started, report.selected_count, report.invalid_blocked_count,
                 report.attempted_count, report.http_request_count, report.succeeded_count,
                 report.conflict_retry_count, report.error_retry_count, report.not_found_count,
                 report.request_rejected_blocked_count, report.auth_stopped, report.auth_stop_saved,
                 report.result_save_failed, report.outcome_unknown, report.batch_limit_reached,
+                report.limit_reason, report.batch_count,
                 report.stop_reason, report.error)
         finally:
             session.close()
