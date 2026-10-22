@@ -40,6 +40,17 @@ class RecommendationHarnessTests(unittest.TestCase):
         self.assertEqual(len(updates), 1)
         self.assertEqual(updates[0].args[1], (100, False, 1))
 
+    def test_run_outbox_rows_are_captured_and_deleted_before_price_restore(self):
+        session, cursor = self.session()
+        session.scan_run_id = "00000000000040008000000000000001"
+        with patch.object(PostgresApplySession, "close"):
+            session.close()
+        self.assertTrue(session.restored)
+        statements = [call.args[0].split()[0] for call in cursor.execute.call_args_list]
+        self.assertLess(statements.index("DELETE"), statements.index("UPDATE"))
+        delete = next(call for call in cursor.execute.call_args_list if call.args[0].startswith("DELETE"))
+        self.assertEqual(str(delete.args[1][0]), "00000000-0000-4000-8000-000000000001")
+
     def test_unexpected_price_is_not_overwritten_during_cleanup(self):
         session, cursor = self.session(current_price=999)
         with patch.object(PostgresApplySession, "close") as close:
