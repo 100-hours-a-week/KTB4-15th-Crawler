@@ -1,6 +1,6 @@
 # 가격 갱신 크롤러 dev CD (develop 브랜치 → V2 dev ECS Scheduled Task)
-# - 크롤러는 ECS Service가 아니다. EventBridge Scheduler(매일 04:00 KST)가 family ARN으로
-#   최신 ACTIVE revision을 RunTask한다. 그래서 배포 = revision 등록이다 (서비스 갱신 없음).
+# - 크롤러는 ECS Service가 아니다. EventBridge Scheduler가 family ARN으로 최신 ACTIVE revision을
+#   RunTask한다 (수집 --apply 매일 11:00, 전송 --deliver 5분마다). 그래서 배포 = revision 등록이다.
 # - Task Definition은 CLOUD 레포 Terraform이 S3 템플릿(dev/v2/crawler.json)으로 관리한다.
 #   이 워크플로는 템플릿의 __DIGEST__만 이번 이미지 digest로 바꿔 등록한다.
 # - 이미지 태그는 커밋 SHA 7자리. ECR이 IMMUTABLE이라 같은 태그는 덮어쓰지 못하고 push가 실패한다.
