@@ -100,12 +100,15 @@ jobs:
           cache-from: type=gha,scope=price-refresh
           cache-to: type=gha,mode=max,scope=price-refresh
 
+  # V2 dev(ECS) 배포 중지 (2026-11-08): V3(EKS) 전환으로 V2 배포를 멈춘다.
+  # 저장소 변수 V2_DEV_DEPLOY_ENABLED를 두지 않으므로 skipped. 긴급 배포·롤백이 필요하면 변수를 'true'로 만들면 PR 없이 다시 켜진다.
   register:
     name: dev-register
     needs: build-and-push
     if: >-
       ${{
         always() &&
+        vars.V2_DEV_DEPLOY_ENABLED == 'true' &&
         (
           (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
           github.event_name == 'workflow_dispatch'

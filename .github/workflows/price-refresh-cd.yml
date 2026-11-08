@@ -96,12 +96,15 @@ jobs:
           cache-from: type=gha,scope=price-refresh
           cache-to: type=gha,mode=max,scope=price-refresh
 
+  # V2 prod(ECS) 배포 동결 (2026-11-08): V3(EKS) 전환 준비 중 V2 prod 배포를 멈춘다 (서비스 중인 Task는 유지).
+  # 저장소 변수 V2_PROD_DEPLOY_ENABLED를 두지 않으므로 skipped. 긴급 배포·롤백이 필요하면 변수를 'true'로 만들면 PR 없이 다시 켜진다.
   register:
     name: prod-register
     needs: build-and-push
     if: >-
       ${{
         always() &&
+        vars.V2_PROD_DEPLOY_ENABLED == 'true' &&
         (
           (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
           github.event_name == 'workflow_dispatch'
