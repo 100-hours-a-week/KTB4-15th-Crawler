@@ -1,4 +1,4 @@
-# 가격 갱신 크롤러 prod CD (main 브랜치 → V2 prod ECS Scheduled Task)
+# 가격 갱신 크롤러 prod CD (main 브랜치 → V3 Prod 이미지 승격, V2는 조건부 유지)
 # - 크롤러는 ECS Service가 아니다. EventBridge Scheduler가 family ARN으로 최신 ACTIVE revision을
 #   RunTask한다 (수집 --apply 매일 11:00, 전송 --deliver 5분마다). 그래서 배포 = revision 등록이다.
 # - Task Definition은 CLOUD 레포 Terraform이 S3 템플릿(prod/v2/crawler.json)으로 관리한다.
@@ -10,8 +10,8 @@ name: Price refresh CD
 
 run-name: >-
   ${{ github.event_name == 'push'
-      && format('Price refresh deploy - {0}', github.sha)
-      || format('Price refresh rollback - {0}', inputs.image_tag) }}
+      && format('Price refresh prod V3 image promotion - {0}', github.sha)
+      || format('Price refresh V2 rollback - {0}', inputs.image_tag) }}
 
 on:
   # main이 갱신되면 자동 배포 (develop→main 머지, hotfix→main 머지 모두 포함)
@@ -44,9 +44,10 @@ env:
   BUILD_CONTEXT: price-refresh-crawler
 
 jobs:
+  # V2가 다시 활성화될 때만 Prod 전용 이미지를 빌드한다. 평상시 V3 승격은 Dev 이미지를 재사용한다.
   build-and-push:
     name: prod-build
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.event_name == 'push' && vars.V2_PROD_DEPLOY_ENABLED == 'true' }}
     # Task Definition이 ARM64(Graviton)라 ARM 러너에서 네이티브로 빌드한다.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
@@ -248,3 +249,119 @@ jobs:
             exit 1
           fi
           echo "다음 Scheduler 실행부터 ${REQUESTED##*/} 사용"
+
+  # V3 Prod(EKS)는 main에서 재빌드하지 않고 해당 Release에 포함된 Dev 검증 Digest를 승격한다.
+  # V2가 재활성화돼도 이 Job은 build-and-push와 의존성이 없어 병렬로 실행된다.
+  publish-v3-prod:
+    name: publish-v3-prod
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: 승격 대상 Dev Commit 확인
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MCrawlerN_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          DEV_SHA=$(gh api "repos/$REPOSITORY/commits/$MCrawlerN_SHA/pulls" \
+            --jq '[.[] | select(.base.ref == "main")][0].head.sha // empty')
+          if [[ -z "$DEV_SHA" ]]; then DEV_SHA="$MCrawlerN_SHA"; fi
+          if [[ ! "$DEV_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::승격 대상 Dev commit SHA를 확인할 수 없습니다: '$DEV_SHA'"
+            exit 1
+          fi
+          echo "dev_sha=$DEV_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: 성공한 Dev CD 실행 확인
+        id: dev-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEV_SHA: ${{ steps.source.outputs.dev_sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          RUN_ID=$(gh api --method GET \
+            "repos/$REPOSITORY/actions/workflows/price-refresh-dev-cd.yml/runs" \
+            -f head_sha="$DEV_SHA" -f status="success" -f event="push" -f per_page="10" \
+            --jq '.workflow_runs[0].id // empty')
+          if [[ -z "$RUN_ID" ]]; then
+            echo "::error::$DEV_SHA 이미지가 성공한 Crawler dev CD에서 검증된 기록이 없습니다."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "run_url=https://github.com/$REPOSITORY/actions/runs/$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Dev 이미지 승격 증빙 다운로드
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.dev-run.outputs.run_id }}
+          DEV_SHA: ${{ steps.source.outputs.dev_sha }}
+        run: |
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "crawler-dev-image-$DEV_SHA" --dir "$RUNNER_TEMP/dev-image"
+
+      - name: Dev 이미지 승격 증빙 검증
+        id: image
+        env:
+          DEV_SHA: ${{ steps.source.outputs.dev_sha }}
+        run: |
+          PROVENANCE="$RUNNER_TEMP/dev-image/crawler-dev-image.json"
+          test -s "$PROVENANCE" || { echo "::error::Dev 이미지 증빙 파일이 없습니다."; exit 1; }
+          RECORDED_SHA=$(jq -er '.source_sha' "$PROVENANCE")
+          DIGEST=$(jq -er '.digest' "$PROVENANCE")
+          if [[ "$RECORDED_SHA" != "$DEV_SHA" ]]; then
+            echo "::error::증빙 Commit이 승격 대상과 다릅니다: expected=$DEV_SHA actual=$RECORDED_SHA"
+            exit 1
+          fi
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::증빙 digest 형식이 잘못되었습니다: '$DIGEST'"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: GitOps GitHub App Token 발급
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.DEV_IMAGE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.DEV_IMAGE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: KTB4-15th-GITOPS
+          permission-contents: write
+
+      - name: GitOps Prod 이미지 승격 요청
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          DEV_SHA: ${{ steps.source.outputs.dev_sha }}
+          DEV_RUN_URL: ${{ steps.dev-run.outputs.run_url }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          jq -n \
+            --arg event_type "prod-image-published" \
+            --arg environment "prod" \
+            --arg image_key "crawler" \
+            --arg digest "$DIGEST" \
+            --arg source_repository "$SOURCE_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_run_url "$SOURCE_RUN_URL" \
+            '{event_type: $event_type, client_payload: {environment: $environment, image_key: $image_key, digest: $digest, source_repository: $source_repository, source_sha: $source_sha, source_run_url: $source_run_url}}' \
+          | gh api --method POST "repos/100-hours-a-week/KTB4-15th-GITOPS/dispatches" --input -
+
+          {
+            echo "### Crawler V3 Prod 이미지 승격 요청"
+            echo "- Dev 검증 Commit: \`$DEV_SHA\`"
+            echo "- Dev 검증 실행: $DEV_RUN_URL"
+            echo "- 승격 Digest: \`$DIGEST\`"
+            echo "- 영향 CronJob: \`price-crawler-apply\`, \`price-crawler-deliver\`"
+            echo "- 반영 시점: GitOps 반영 뒤 다음 예약 Job 및 수동 Job부터"
+            echo "- GitOps 이벤트: \`prod-image-published\`"
+          } >> "$GITHUB_STEP_SUMMARY"
