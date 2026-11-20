@@ -1,12 +1,10 @@
-# 가격 갱신 크롤러 dev CD (develop 브랜치 → V2 ECS Scheduled Task·V3 EKS CronJob)
-# - 크롤러는 ECS Service가 아니다. EventBridge Scheduler가 family ARN으로 최신 ACTIVE revision을
-#   RunTask한다 (수집 --apply 매일 11:00, 전송 --deliver 5분마다). 그래서 배포 = revision 등록이다.
-# - 이미지는 한 번만 빌드한다. 같은 digest를 V2 Task Definition에 등록하고 V3 GitOps에 전달한다.
-#   V3 CronJob은 Rolling Update하지 않으며 GitOps 반영 뒤 새로 생성되는 Job부터 새 digest를 사용한다.
-# - Task Definition은 CLOUD 레포 Terraform이 S3 템플릿(dev/v2/crawler.json)으로 관리한다.
-#   이 워크플로는 템플릿의 __DIGEST__만 이번 이미지 digest로 바꿔 등록한다.
-# - 이미지 태그는 커밋 SHA 7자리. ECR이 IMMUTABLE이라 같은 태그는 덮어쓰지 못하고 push가 실패한다.
-# - GitHub Environment "develop" 변수: CRAWLER_BUILD_ROLE_ARN, CRAWLER_DEPLOY_ROLE_ARN
+# 가격 갱신 크롤러 dev CD (develop 브랜치 → Single Dev EC2)
+# - develop push: ARM64 이미지 빌드 → ECR push(태그 = 커밋 SHA 7자리) → SSM Document로 EC2의 Crawler 이미지 교체
+# - workflow_dispatch: 이미 ECR에 있는 태그로 빌드 없이 교체(롤백)
+# - Crawler는 상시 컨테이너가 아니다. 교체 후 다음 수동 실행(run-crawler.sh)부터 새 이미지를 쓴다.
+# - ECR이 IMMUTABLE이라 같은 태그는 덮어쓰지 못한다.
+# - 저장소 변수: AWS_DEPLOY_ROLE_ARN, SINGLE_DEV_INSTANCE_ID
+#   OIDC Role은 refs/heads/develop만 신뢰하므로 job에 environment를 두지 않는다(environment를 쓰면 sub가 바뀐다).
 name: Price refresh dev CD
 
 run-name: >-
@@ -15,16 +13,13 @@ run-name: >-
       || format('Price refresh dev rollback - {0}', inputs.image_tag) }}
 
 on:
-  # paths 필터를 두지 않는다. 필수 체크로 쓸 때 문서만 바뀐 커밋에서 실행되지 않으면
-  # PR이 체크를 계속 기다리게 된다 (BE dev CD와 같은 규칙).
   push:
-    branches: ["develop", "hotfix/**"]
+    branches: ["develop"]
 
-  # 이미 ECR에 있는 이미지로 revision을 다시 등록할 때(롤백) 사용한다.
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "등록할 ECR 이미지 태그(7자리 SHA)"
+        description: "배포할 ECR 이미지 태그(7자리 SHA)"
         required: true
         type: string
       reason:
@@ -35,48 +30,55 @@ on:
 permissions: {}
 
 concurrency:
-  group: lookddak-price-refresh-dev
+  group: lookddak-single-dev-crawler
   cancel-in-progress: false
 
 env:
   AWS_REGION: ap-northeast-2
   ECR_REPOSITORY: lookddak-dev-crawler
-  TASK_FAMILY: lookddak-dev-v2-crawler
-  TEMPLATE_KEY: dev/v2/crawler.json
+  SSM_DOCUMENT: lookddak-dev-single-update-crawler
   BUILD_CONTEXT: price-refresh-crawler
 
 jobs:
-  build-and-push:
-    name: dev-build
-    if: ${{ github.event_name == 'push' }}
-    # Task Definition이 ARM64(Graviton)라 ARM 러너에서 네이티브로 빌드한다.
+  deploy:
+    name: dev-deploy
+    # EC2가 ARM64(Graviton)라 ARM 러너에서 네이티브로 빌드한다.
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
-    environment: develop
+    timeout-minutes: 30
     permissions:
       id-token: write
       contents: read
-    outputs:
-      tag: ${{ steps.vars.outputs.tag }}
-      digest: ${{ steps.image.outputs.digest }}
     steps:
-      - name: Guard - develop / hotfix 브랜치 확인
-        if: ${{ github.ref != 'refs/heads/develop' && !startsWith(github.ref, 'refs/heads/hotfix/') }}
+      - name: Guard - develop 브랜치 확인
+        if: ${{ github.ref != 'refs/heads/develop' }}
         run: |
-          echo "develop, hotfix/* 브랜치만 dev에 배포할 수 있습니다. 현재 ref: ${GITHUB_REF}"
+          echo "develop 브랜치에서만 배포할 수 있습니다. 현재 ref: ${GITHUB_REF}"
           exit 1
-
-      - name: Checkout
-        uses: actions/checkout@v4
 
       - name: 이미지 태그 결정
         id: vars
-        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            TAG="${GITHUB_SHA::7}"
+          else
+            TAG="$INPUT_TAG"
+          fi
+          if [[ ! "$TAG" =~ ^[0-9a-f]{7}$ ]]; then
+            echo "::error::이미지 태그는 7자리 SHA여야 합니다: '$TAG'"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: AWS 인증 - build role
+      - name: Checkout
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/checkout@v4
+
+      - name: AWS 인증
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.CRAWLER_BUILD_ROLE_ARN }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: ECR 로그인
@@ -84,11 +86,12 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Buildx 준비
+        if: ${{ github.event_name == 'push' }}
         uses: docker/setup-buildx-action@v3
 
       # Dockerfile의 test 단계가 단위 테스트를 실행한다. 실패하면 push되지 않는다.
       - name: 빌드 및 ECR push
-        id: image
+        if: ${{ github.event_name == 'push' }}
         uses: docker/build-push-action@v6
         with:
           context: ${{ env.BUILD_CONTEXT }}
@@ -100,252 +103,58 @@ jobs:
           cache-from: type=gha,scope=price-refresh
           cache-to: type=gha,mode=max,scope=price-refresh
 
-      # Prod에서는 이미지를 다시 빌드하지 않고 이 증빙의 동일 Digest를 승격한다.
-      - name: Dev 이미지 승격 증빙 생성
-        env:
-          DIGEST: ${{ steps.image.outputs.digest }}
-          SOURCE_SHA: ${{ github.sha }}
-          SOURCE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::빌드 digest 형식이 잘못되었습니다: '$DIGEST'"
-            exit 1
-          fi
-          jq -n \
-            --arg source_sha "$SOURCE_SHA" \
-            --arg digest "$DIGEST" \
-            --arg source_run_url "$SOURCE_RUN_URL" \
-            '{source_sha: $source_sha, digest: $digest, source_run_url: $source_run_url}' \
-            > "$RUNNER_TEMP/crawler-dev-image.json"
-
-      - name: Dev 이미지 승격 증빙 보관
-        uses: actions/upload-artifact@v4
-        with:
-          name: crawler-dev-image-${{ github.sha }}
-          path: ${{ runner.temp }}/crawler-dev-image.json
-          if-no-files-found: error
-          retention-days: 30
-
-  # V2 dev(ECS) 배포 중지 (2026-11-08): V3(EKS) 전환으로 V2 배포를 멈춘다.
-  # 저장소 변수 V2_DEV_DEPLOY_ENABLED를 두지 않으므로 skipped. 긴급 배포·롤백이 필요하면 변수를 'true'로 만들면 PR 없이 다시 켜진다.
-  register:
-    name: dev-register
-    needs: build-and-push
-    if: >-
-      ${{
-        always() &&
-        vars.V2_DEV_DEPLOY_ENABLED == 'true' &&
-        (
-          (github.event_name == 'push' && needs.build-and-push.result == 'success') ||
-          github.event_name == 'workflow_dispatch'
-        )
-      }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    environment: develop
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - name: Guard - develop / hotfix 브랜치 확인
-        if: ${{ github.ref != 'refs/heads/develop' && !startsWith(github.ref, 'refs/heads/hotfix/') }}
-        run: |
-          echo "develop, hotfix/* 브랜치의 워크플로만 dev에 배포할 수 있습니다. 현재 ref: ${GITHUB_REF}"
-          exit 1
-
-      - name: 태그와 사유 확정
-        id: meta
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.image_tag }}
-          INPUT_REASON: ${{ inputs.reason }}
-          BUILT_TAG: ${{ needs.build-and-push.outputs.tag }}
-        run: |
-          if [[ "$EVENT_NAME" == "push" ]]; then
-            TAG="$BUILT_TAG"
-            REASON="${GITHUB_REF_NAME} push by ${GITHUB_ACTOR}"
-          else
-            TAG="$INPUT_TAG"
-            REASON="$INPUT_REASON"
-          fi
-          if [[ ! "$TAG" =~ ^[0-9a-f]{7}$ ]]; then
-            echo "태그 형식이 잘못되었습니다: '$TAG'"
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          {
-            echo "reason<<__EOF__"
-            echo "$REASON"
-            echo "__EOF__"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: AWS 인증 - deploy role
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.CRAWLER_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
+      # 빌드와 롤백 모두 ECR에서 digest를 조회해 같은 방식으로 고정한다.
       - name: 이미지 digest 조회
         id: image
         env:
-          TAG: ${{ steps.meta.outputs.tag }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ steps.vars.outputs.tag }}
         run: |
           DIGEST=$(aws ecr describe-images \
             --repository-name "$ECR_REPOSITORY" \
             --image-ids imageTag="$TAG" \
             --query 'imageDetails[0].imageDigest' --output text) \
-          || { echo "ECR에 ${ECR_REPOSITORY}:${TAG} 이미지가 없습니다."; exit 1; }
+            || { echo "::error::ECR에 ${ECR_REPOSITORY}:${TAG} 이미지가 없습니다."; exit 1; }
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "digest 형식이 잘못되었습니다: '$DIGEST'"
+            echo "::error::digest 형식이 잘못되었습니다: '$DIGEST'"
             exit 1
           fi
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "ref=${REGISTRY}/${ECR_REPOSITORY}@${DIGEST}" >> "$GITHUB_OUTPUT"
 
-      # 버킷 이름에 계정 ID가 들어가므로 레포에 적지 않고 실행 시 만든다.
-      - name: Task Definition 템플릿 다운로드
-        id: template
-        run: |
-          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-          BUCKET="lookddak-ecs-taskdef-${ACCOUNT}-${AWS_REGION}"
-          VERSION=$(aws s3api get-object \
-            --bucket "$BUCKET" --key "$TEMPLATE_KEY" \
-            "$RUNNER_TEMP/template.json" \
-            --query VersionId --output text)
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "repository_uri=${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}" >> "$GITHUB_OUTPUT"
-
-      # __DIGEST__만 바꾸고, family·컨테이너 수·이미지 저장소가 예상과 같은지 확인한다.
-      - name: digest 치환 및 검증
+      - name: Single Dev EC2 이미지 교체
         env:
-          DIGEST: ${{ steps.image.outputs.digest }}
-          REPOSITORY_URI: ${{ steps.template.outputs.repository_uri }}
+          INSTANCE_ID: ${{ vars.SINGLE_DEV_INSTANCE_ID }}
+          IMAGE: ${{ steps.image.outputs.ref }}
+          TAG: ${{ steps.vars.outputs.tag }}
         run: |
-          TEMPLATE="$RUNNER_TEMP/template.json"
-          TASKDEF="$RUNNER_TEMP/taskdef.json"
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "$SSM_DOCUMENT" \
+            --parameters "image=${IMAGE}" \
+            --comment "crawler ${TAG} by ${GITHUB_ACTOR}" \
+            --query Command.CommandId --output text)
+          echo "SSM command: $COMMAND_ID"
 
-          jq -e --arg family "$TASK_FAMILY" --arg image "${REPOSITORY_URI}@__DIGEST__" '
-            .family == $family and
-            (.containerDefinitions | length) == 1 and
-            .containerDefinitions[0].image == $image
-          ' "$TEMPLATE" > /dev/null \
-          || { echo "::error::템플릿이 예상과 다릅니다 (family, 컨테이너 수, image 확인)"; exit 1; }
+          STATUS=Pending
+          for _ in $(seq 1 120); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) break ;; esac
+          done
 
-          jq --arg digest "$DIGEST" \
-            '.containerDefinitions[0].image |= sub("@__DIGEST__$"; "@" + $digest)' \
-            "$TEMPLATE" > "$TASKDEF"
-
-          if grep -q '__DIGEST__' "$TASKDEF"; then
-            echo "::error::치환 후에도 __DIGEST__가 남아 있습니다."
-            exit 1
-          fi
-          jq -e --arg image "${REPOSITORY_URI}@${DIGEST}" \
-            '.containerDefinitions[0].image == $image' "$TASKDEF" > /dev/null \
-          || { echo "::error::치환 결과 image가 예상과 다릅니다."; exit 1; }
-
-      # 등록만 한다. Scheduler가 다음 실행부터 이 revision(최신 ACTIVE)을 쓴다.
-      - name: revision 등록
-        id: register
-        run: |
-          ARN=$(aws ecs register-task-definition \
-            --cli-input-json "file://$RUNNER_TEMP/taskdef.json" \
-            --query 'taskDefinition.taskDefinitionArn' --output text)
-          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
-          echo "등록: $ARN"
-
-      # 실제로 실행될 revision(family의 최신 ACTIVE)이 방금 등록한 것이고 이미지가 이번 digest인지 확인한다.
-      - name: 등록 결과 확인
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
-          REASON: ${{ steps.meta.outputs.reason }}
-          DIGEST: ${{ steps.image.outputs.digest }}
-          REQUESTED: ${{ steps.register.outputs.arn }}
-          TEMPLATE_VERSION: ${{ steps.template.outputs.version }}
-        run: |
-          read -r LATEST IMAGE STATUS < <(aws ecs describe-task-definition \
-            --task-definition "$TASK_FAMILY" \
-            --query 'taskDefinition.[taskDefinitionArn,containerDefinitions[0].image,status]' \
-            --output text)
-          {
-            echo "### 가격 갱신 크롤러 dev revision 등록"
-            echo "- 태그: \`${TAG}\` / 사유: ${REASON}"
-            echo "- digest: \`${DIGEST}\`"
-            echo "- 템플릿: \`${TEMPLATE_KEY}\` (S3 버전 \`${TEMPLATE_VERSION}\`)"
-            echo "- 등록 revision: \`${REQUESTED}\`"
-            echo "- 최신 ACTIVE: \`${LATEST}\` (${STATUS})"
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$LATEST" != "$REQUESTED" || "$STATUS" != "ACTIVE" || "$IMAGE" != *"@${DIGEST}" ]]; then
-            echo "::error::최신 ACTIVE revision이 방금 등록한 revision과 다릅니다."
-            exit 1
-          fi
-          echo "다음 Scheduler 실행부터 ${REQUESTED##*/} 사용"
-
-  # V3 dev(EKS) CronJob은 GitOps 저장소에 동일한 digest의 갱신을 요청한다.
-  # 수동 rollback은 V2 revision 재등록 전용이므로 새 이미지를 빌드한 push에서만 실행한다.
-  publish-v3-dev:
-    name: publish-v3-dev
-    needs: build-and-push
-    if: ${{ github.event_name == 'push' && needs.build-and-push.result == 'success' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    environment: develop
-    permissions:
-      contents: read
-    steps:
-      - name: GitOps GitHub App Token 발급
-        id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ vars.DEV_IMAGE_BOT_CLIENT_ID }}
-          private-key: ${{ secrets.DEV_IMAGE_BOT_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: KTB4-15th-GITOPS
-          permission-contents: write
-
-      - name: GitOps dev 이미지 갱신 요청
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          DIGEST: ${{ needs.build-and-push.outputs.digest }}
-          SOURCE_REPOSITORY: ${{ github.repository }}
-          SOURCE_SHA: ${{ github.sha }}
-          SOURCE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::빌드 digest 형식이 잘못되었습니다: '$DIGEST'"
-            exit 1
-          fi
-          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::원본 commit SHA 형식이 잘못되었습니다: '$SOURCE_SHA'"
-            exit 1
-          fi
-
-          jq -n \
-            --arg event_type "dev-image-published" \
-            --arg environment "dev" \
-            --arg image_key "crawler" \
-            --arg digest "$DIGEST" \
-            --arg source_repository "$SOURCE_REPOSITORY" \
-            --arg source_sha "$SOURCE_SHA" \
-            --arg source_run_url "$SOURCE_RUN_URL" \
-            '{
-              event_type: $event_type,
-              client_payload: {
-                environment: $environment,
-                image_key: $image_key,
-                digest: $digest,
-                source_repository: $source_repository,
-                source_sha: $source_sha,
-                source_run_url: $source_run_url
-              }
-            }' \
-          | gh api --method POST \
-              "repos/100-hours-a-week/KTB4-15th-GITOPS/dispatches" \
-              --input -
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query '[StandardOutputContent,StandardErrorContent]' --output text || true
 
           {
-            echo "### 가격 갱신 크롤러 dev V3(EKS) GitOps 갱신 요청"
-            echo "- digest: \`$DIGEST\`"
-            echo "- 영향 CronJob: \`price-crawler-apply\`, \`price-crawler-deliver\`"
-            echo "- 반영 시점: GitOps 반영 뒤 새로 생성되는 Job부터"
-            echo "- GitOps 이벤트: \`dev-image-published\`"
-            echo "- 원본 실행: $SOURCE_RUN_URL"
+            echo "### Crawler dev 배포: ${STATUS}"
+            echo "- 이미지: \`${IMAGE}\`"
+            echo "- 태그: \`${TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$STATUS" != "Success" ]]; then
+            echo "::error::Single Dev 배포 실패: ${STATUS}"
+            exit 1
+          fi
